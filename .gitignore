@@ -1,0 +1,23 @@
+# Build
+build/
+dist/
+*.o
+*.so
+*.a
+*.egg-info/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+compile_commands.json
