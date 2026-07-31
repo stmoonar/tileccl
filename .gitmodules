@@ -1,0 +1,8 @@
+[submodule "third_party/cutlass"]
+	path = third_party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+	branch = main
+[submodule "third_party/ThunderKittens"]
+	path = third_party/ThunderKittens
+	url = https://github.com/HazyResearch/ThunderKittens.git
+	branch = main
