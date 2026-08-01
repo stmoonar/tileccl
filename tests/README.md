@@ -1,4 +1,50 @@
-# P2P microbench：Copy Engine vs TMA
+# P2P microbench
+
+两个独立的可执行文件，`make` 一次全部构建：
+
+| binary | 回答的问题 |
+|---|---|
+| `p2p_ce_vs_tma` | 通算融合应该走哪条搬运路径、tile 该多大（按 token 粒度扫） |
+| `pk_bw_sweep` | 复现 ParallelKittens 论文（arXiv:2511.13940）Fig.2 / Fig.3 / Tab.1：不同传输机制在不同**消息大小**和**SM 数**下打到的带宽 |
+
+---
+
+## pk_bw_sweep：论文 Fig.2 / Fig.3 复现
+
+三种机制，全部是 push（源 GPU 执行）：
+
+| method | 机制 | 对应论文 |
+|---|---|---|
+| `ce` | 每条消息一次 `cudaMemcpyPeerAsync`（host 发起，DMA 引擎） | Copy Engine |
+| `tma` | kernel 内 `cp.async.bulk`：local gmem → smem → peer gmem，mbarrier 流水 | TMA Op |
+| `reg` | kernel 内 `uint4` ld/st 直写 peer VA | Register Op |
+
+两组 sweep：
+
+- **Fig.2（`--mode size`）**：固定总量（默认 1 GiB），把它切成大小为 S 的消息，扫 S 从 128 B 到 1 GiB，看每种机制的带宽曲线。论文结论：CE 需要 ≥256 MB 消息才能到 80% 利用率，TMA 2 KB 就能接近峰值。
+- **Fig.3（`--mode sms`）**：固定消息大小，扫参与搬运的 SM（CTA）数，看多少个 SM 能打满互联带宽。论文结论：TMA 约 15 个 SM 饱和，register op 需要约 76 个。CE 不占 SM，作为参考线单独打一行。
+
+```bash
+./pk_bw_sweep                                        # 两组 sweep 全跑，1 GiB
+./pk_bw_sweep --mode size --sizes 128,2K,64K,2M,64M,1G
+./pk_bw_sweep --mode sms --sms 1,2,4,8,16,32 --msg-reg 16K
+./pk_bw_sweep --total 256M --iters 20                # 显存紧张时缩小总量
+```
+
+主要参数：`--total`（每次测量的总载荷）、`--sizes` / `--sms`（两个 sweep 的扫描点，支持 K/M/G 后缀）、`--stages`（TMA 流水深度 3/4/6/8）、`--reg-threads`（reg kernel 每 CTA 线程数，默认 1024）、`--max-ce-msgs`（小消息时 CE 每轮最多发几条，防止 host 端 enqueue 时间爆炸）。
+
+输出单元格里的标记：
+
+- `*`：CE 载荷被 `--max-ce-msgs` 截短（带宽按实际搬运字节数算，小消息下这正是要测的 per-call 开销）；
+- `^`：消息太大装不下 ≥3 级流水，TMA 退化为单 buffer load→store（本地 load 远快于 P2P store，误差很小）；
+- `-`：超过 shared memory 预算，TMA 无法承载该消息大小（论文在这个区间直接把曲线画平，对应 H100/B200 的 227 KB 上限）；
+- `!`：目的端校验失败。
+
+注意：论文是 NVLink（H100/B200），本机是 PCIe 上的 sm_120，绝对数值不可比，但曲线形状（各机制的饱和粒度 / 饱和 SM 数）是同一组问题。
+
+---
+
+## p2p_ce_vs_tma：Copy Engine vs TMA
 
 用来回答一个问题：**在 PCIe 互联的两张 sm_120 上，tile 粒度的通算融合应该走哪条搬运路径、tile 该多大。**
 

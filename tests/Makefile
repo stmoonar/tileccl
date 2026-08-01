@@ -1,4 +1,4 @@
-# Build for the P2P microbenchmark.
+# Build for the P2P microbenchmarks.
 #
 #   make                     # default: sm_120a (Blackwell consumer, CUDA >= 12.8)
 #   make ARCH=sm_120         # if the toolkit rejects the family-specific arch
@@ -12,18 +12,22 @@ NVCC     ?= nvcc
 ARCH     ?= sm_120a
 NVCCFLAGS := -O3 -std=c++17 -lineinfo -arch=$(ARCH)
 
-TARGET := p2p_ce_vs_tma
+TARGETS := p2p_ce_vs_tma pk_bw_sweep
 
 .PHONY: all clean ptx
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(TARGET).cu
+p2p_ce_vs_tma: p2p_ce_vs_tma.cu
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+pk_bw_sweep: pk_bw_sweep.cu
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 # Handy when checking that cp.async.bulk actually survives to the final PTX.
-ptx: $(TARGET).cu
-	$(NVCC) $(NVCCFLAGS) -ptx -o $(TARGET).ptx $<
+ptx: p2p_ce_vs_tma.cu pk_bw_sweep.cu
+	$(NVCC) $(NVCCFLAGS) -ptx -o p2p_ce_vs_tma.ptx p2p_ce_vs_tma.cu
+	$(NVCC) $(NVCCFLAGS) -ptx -o pk_bw_sweep.ptx pk_bw_sweep.cu
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe $(TARGET).ptx
+	rm -f $(TARGETS) $(addsuffix .exe,$(TARGETS)) $(addsuffix .ptx,$(TARGETS))
