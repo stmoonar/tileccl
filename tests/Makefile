@@ -12,7 +12,7 @@ NVCC     ?= nvcc
 ARCH     ?= sm_120a
 NVCCFLAGS := -O3 -std=c++17 -lineinfo -arch=$(ARCH)
 
-TARGETS := p2p_ce_vs_tma pk_bw_sweep interference_matrix sync_cost
+TARGETS := p2p_ce_vs_tma pk_bw_sweep interference_matrix sync_cost intra_sm_matrix
 
 .PHONY: all clean ptx
 
@@ -28,6 +28,9 @@ interference_matrix: interference_matrix.cu
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 sync_cost: sync_cost.cu
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+intra_sm_matrix: intra_sm_matrix.cu
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 # Handy when checking that cp.async.bulk actually survives to the final PTX.

@@ -8,6 +8,7 @@
 | `pk_bw_sweep` | 复现 ParallelKittens 论文（arXiv:2511.13940）Fig.2 / Fig.3 / Tab.1：不同传输机制在不同**消息大小**和**SM 数**下打到的带宽 |
 | `interference_matrix` | 通信对计算、计算对通信的**双向干扰矩阵**(通信方式 x 计算瓶颈类型),以及满载 SM 下三种搬运方式的 progress/starvation 行为 |
 | `sync_cost` | 细粒度 pipeline 的同步原语成本:跨卡 flag 单向延迟、fence+signal 尾部开销、远端 atomic 往返、本地 mbarrier 周期 |
+| `intra_sm_matrix` | **SM 内部**(warp-specialized 融合)的通算干扰:通信 warp 和计算 warp 同 CTA 时,issue slot / LSU / 内存管线的动态竞争与让出 warp 的静态代价 |
 
 ---
 
@@ -217,3 +218,36 @@ nvidia-smi -rgc
 有了 1-3 的数据,融合成本模型可以写成:
 `T_fused ~= max(T_c x S_c(comm, bottleneck), T_m x S_m(comm, bottleneck)) + N_tiles x sync_cost`,
 再用真实 fused kernel 验证预测误差。
+---
+
+## intra_sm_matrix:SM 内部(warp-specialized 融合)的通算干扰
+
+`interference_matrix` 测的是 inter-SM 干扰(通信是独立 kernel,与计算抢 DRAM/L2/链路和 CTA 名额)。真正的融合 kernel 里,通信 warp 和计算 warp 在**同一个 CTA**,抢的是另一组资源:warp scheduler 的 issue slot、LSU/MIO 管线、寄存器文件、smem 容量与 bank。这个工具量化的就是这部分。
+
+### 方法学
+
+一个 fused kernel,每 SM 一个 CTA、每 CTA W 个 warp(默认 16):
+
+- warp [0, C):通信 —— `ldst`(uint4 直写 peer VA)或 `tma`(lane 0 驱动 cp.async.bulk 流水,local gmem → smem → peer gmem);
+- warp [C, W):计算探针 —— `mma` / `ffma` / `smem` / `hbm` 的 per-warp 版本。
+
+全部跑到 stop flag,每个 warp 上报迭代数,同一窗口内同时得到计算吞吐和通信带宽。**两个基线把"给通信让 warp"的代价拆成两半**:
+
+- `S_warp` = R(C=0 全算) / R(通信 warp 进场即退出):让出 C 个 warp 的**静态代价**(纯并行度损失,无竞争);
+- `S_intra` = R(通信 warp 退出) / R(通信 warp 活跃):同样 warp 数下,通信活动本身的**动态代价**(issue slot、LSU/MIO、内存管线)。
+
+预期模式(校验数据用):`tma` 的 S_intra 应接近 1.00(每 warp 只有一个线程偶尔发 bulk 指令);`ldst` 对 `ffma`(issue-bound)和 `smem`(LSU/MIO-bound)的 S_intra 应明显大于对 `mma`(tensor pipe 独立,发射率低);`S_warp` 对 compute-bound 探针应 ≈ W/(W−C)。
+
+```bash
+./intra_sm_matrix                                      # 全矩阵,cw 扫 1,2,4
+./intra_sm_matrix --probes ffma,smem --comms ldst --comm-warps 1,2,4,8
+./intra_sm_matrix --warps 16 --msg 16K --csv intra.csv
+```
+
+主要参数:`--warps`(每 CTA warp 数,默认 16)、`--comm-warps`(通信 warp 数扫描点)、`--msg`(消息大小,tma 会按 smem 预算自动折半)、`--stages`(tma 流水深度)、`--blocks`(默认每 SM 一个 CTA)。
+
+### 注意
+
+1. CE 天然没有这张表——它不可能出现在 CTA 里,intra-SM 干扰恒为零;这张表量化的正是 SM 驻留方案相对 CE 多付的那部分。
+2. 每 SM 只有一个 CTA(模拟 FlashAttention 风格的融合 kernel),计算探针的绝对吞吐低于 `interference_matrix` 里满占用的版本,横向对比只看比值。
+3. tma 的 staging smem 会挤占融合 kernel 的 smem 预算,这个静态代价体现在打印出的 dyn smem 数字上,不在 S_intra 里。
