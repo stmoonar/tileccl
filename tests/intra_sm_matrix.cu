@@ -134,6 +134,12 @@ __device__ __forceinline__ void tma_store_wait_all0() {
 // ---------------------------------------------------------------------------
 
 constexpr int kMaxWarps = 32;
+// Iterations between stop-flag checks / counter publishes for the
+// register-resident probes. Without batching, the measurement loop's own
+// load+store per iteration queues behind P2P backpressure in the SM's memory
+// port and gates "pure compute" probes on memory latency -- the very artifact
+// this tool must not measure.
+constexpr int kCheckBatch = 16;
 constexpr int kFfmaUnroll = 512;
 constexpr int kMmaUnroll = 64;
 constexpr int kSmemRounds = 256;
@@ -154,8 +160,8 @@ __device__ __forceinline__ void f_publish(unsigned long long* c, int gw,
 }
 
 __global__ __launch_bounds__(kMaxWarps * 32, 1) void fused_kernel(
-    int probe_id, int comm_id, int comm_warps, const uint32_t* stop,
-    unsigned long long* counters,
+    int probe_id, int comm_id, int comm_warps, int comm_ctas,
+    const uint32_t* stop, unsigned long long* counters,
     // communication buffers (src local, dst on the peer)
     const uint4* __restrict__ csrc, uint4* __restrict__ cdst, uint64_t cbuf_vec,
     uint32_t msg_vec,
@@ -170,7 +176,7 @@ __global__ __launch_bounds__(kMaxWarps * 32, 1) void fused_kernel(
   const int lane = threadIdx.x & 31;
   const int nwarps = blockDim.x >> 5;
   const int gw = blockIdx.x * kMaxWarps + warp;
-  const bool is_comm = warp < comm_warps;
+  const bool is_comm = warp < comm_warps && (int)blockIdx.x < comm_ctas;
 
   for (int i = threadIdx.x; i < kProbeSmemWords; i += blockDim.x)
     psm[i] = i * 2654435761u;
@@ -188,8 +194,8 @@ __global__ __launch_bounds__(kMaxWarps * 32, 1) void fused_kernel(
     if (comm_id == kCommNone) return;  // baseline: cede the warp, no activity
 
     // Each comm warp owns a disjoint slice of the transfer buffers, across
-    // all CTAs, and streams messages of msg_vec uint4s through it.
-    const uint64_t nslices = (uint64_t)gridDim.x * comm_warps;
+    // the comm-carrying CTAs, and streams messages of msg_vec uint4s through it.
+    const uint64_t nslices = (uint64_t)comm_ctas * comm_warps;
     const uint64_t slice = cbuf_vec / nslices;
     const uint64_t base = ((uint64_t)blockIdx.x * comm_warps + warp) * slice;
 
@@ -226,6 +232,10 @@ __global__ __launch_bounds__(kMaxWarps * 32, 1) void fused_kernel(
       while (!f_stop(stop)) {
         const uint32_t s = (uint32_t)(done % stages);
         while (!mbarrier_try_wait(&bar[s], (phase_bits >> s) & 1u)) {
+          // Polite spin: under link backpressure this warp waits most of the
+          // time; hammering try_wait at full issue rate is itself a source of
+          // intra-SM noise a production kernel would avoid.
+          __nanosleep(64);
           if (f_stop(stop)) break;
         }
         phase_bits ^= (1u << s);
@@ -249,9 +259,10 @@ __global__ __launch_bounds__(kMaxWarps * 32, 1) void fused_kernel(
     float a = threadIdx.x * 1e-3f + 1.0f;
     const float b = 1.0000001f, c = 1e-7f;
     while (!f_stop(stop)) {
+      for (int r = 0; r < kCheckBatch; ++r)
 #pragma unroll
-      for (int u = 0; u < kFfmaUnroll; ++u) a = fmaf(a, b, c);
-      ++it;
+        for (int u = 0; u < kFfmaUnroll; ++u) a = fmaf(a, b, c);
+      it += kCheckBatch;
       if (lane == 0) f_publish(counters, gw, it);
     }
     if (a == 12345.678f) counters[gw] = 0;  // defeats DCE, never taken
@@ -264,9 +275,10 @@ __global__ __launch_bounds__(kMaxWarps * 32, 1) void fused_kernel(
     fill_fragment(fb, __float2half(0.999f));
     fill_fragment(fc, __float2half(0.0f));
     while (!f_stop(stop)) {
+      for (int r = 0; r < kCheckBatch; ++r)
 #pragma unroll
-      for (int u = 0; u < kMmaUnroll; ++u) mma_sync(fc, fa, fb, fc);
-      ++it;
+        for (int u = 0; u < kMmaUnroll; ++u) mma_sync(fc, fa, fb, fc);
+      it += kCheckBatch;
       if (lane == 0) f_publish(counters, gw, it);
     }
     if (__half2float(fc.x[0]) == 12345.0f) counters[gw] = 0;
@@ -274,19 +286,20 @@ __global__ __launch_bounds__(kMaxWarps * 32, 1) void fused_kernel(
     const uint32_t wbase = (uint32_t)warp * kSmemWordsPerWarp;
     uint32_t acc = threadIdx.x;
     while (!f_stop(stop)) {
+      for (int rb = 0; rb < kCheckBatch; ++rb)
 #pragma unroll 4
-      for (int r = 0; r < kSmemRounds; ++r)
-        acc += psm[wbase + ((acc ^ (uint32_t)r) & (kSmemWordsPerWarp - 1))];
-      ++it;
+        for (int r = 0; r < kSmemRounds; ++r)
+          acc += psm[wbase + ((acc ^ (uint32_t)r) & (kSmemWordsPerWarp - 1))];
+      it += kCheckBatch;
       if (lane == 0) f_publish(counters, gw, it);
     }
     if (acc == 0xdeadbeefu) counters[gw] = 0;
   } else {  // kProbeHbm: per-warp local streaming copy
-    const int cwarps = nwarps - comm_warps;
-    const uint64_t nslices = (uint64_t)gridDim.x * cwarps;
+    // Partitioned over ALL warps (comm warps' slices simply go unused) so the
+    // layout is identical for comm-carrying and pure-compute CTAs.
+    const uint64_t nslices = (uint64_t)gridDim.x * nwarps;
     const uint64_t slice = pbuf_vec / nslices;
-    const uint64_t base =
-        ((uint64_t)blockIdx.x * cwarps + (warp - comm_warps)) * slice;
+    const uint64_t base = ((uint64_t)blockIdx.x * nwarps + warp) * slice;
     uint64_t pos = 0;
     while (!f_stop(stop)) {
       const uint64_t off = base + pos;
@@ -309,7 +322,8 @@ struct Config {
   std::vector<std::string> comms{"ldst", "tma"};
   std::vector<int> comm_warps{1, 2, 4};
   int warps = 16;
-  int blocks = 0;  // 0 = one per SM
+  int blocks = 0;      // 0 = one per SM
+  int comm_ctas = 0;   // CTAs that carry comm warps; 0 = all
   uint64_t cbuf = 64ull << 20;   // communication buffer
   uint64_t pbuf = 256ull << 20;  // hbm probe buffer (split into two halves)
   uint64_t msg = 16 << 10;
@@ -366,6 +380,7 @@ static Config parse_args(int argc, char** argv) {
       for (auto& t : split_csv(next())) c.comm_warps.push_back(std::atoi(t.c_str()));
     } else if (a == "--warps") c.warps = std::atoi(next().c_str());
     else if (a == "--blocks") c.blocks = std::atoi(next().c_str());
+    else if (a == "--comm-ctas") c.comm_ctas = std::atoi(next().c_str());
     else if (a == "--cbuf") c.cbuf = parse_bytes(next());
     else if (a == "--pbuf") c.pbuf = parse_bytes(next());
     else if (a == "--msg") c.msg = parse_bytes(next());
@@ -382,6 +397,9 @@ static Config parse_args(int argc, char** argv) {
           "  --comm-warps LIST  comm warps per CTA to sweep (default 1,2,4)\n"
           "  --warps N          warps per CTA, <= %d (default 16)\n"
           "  --blocks N         CTAs, 0 = one per SM (default 0)\n"
+          "  --comm-ctas N      only the first N CTAs carry comm warps; the\n"
+          "                     rest are pure compute and reported separately\n"
+          "                     (0 = all CTAs carry comm warps, default)\n"
           "  --msg BYTES        per-message size, 16B multiple (default 16K)\n"
           "  --stages N         tma pipeline depth >= 3 (default 4)\n"
           "  --cbuf/--pbuf B    comm / hbm-probe buffer sizes (64M / 256M)\n"
@@ -520,10 +538,13 @@ int main(int argc, char** argv) {
   const bool tma_ok = tma_dyn(tma_msg) <= dyn_budget;
   const uint32_t tma_stride = (uint32_t)((tma_msg + 127) / 128 * 128);
 
+  const int cc = cfg.comm_ctas > 0 ? std::min(cfg.comm_ctas, blocks) : blocks;
+
   std::printf("=== intra-SM interference (warp-specialized fusion) ===\n");
-  std::printf("GPU %d %s sm_%d%d  %d SMs  %d CTAs x %d warps  window ~%.0f ms\n",
+  std::printf("GPU %d %s sm_%d%d  %d SMs  %d CTAs x %d warps  "
+              "comm CTAs: %d  window ~%.0f ms\n",
               cfg.src_dev, prop.name, prop.major, prop.minor,
-              prop.multiProcessorCount, blocks, cfg.warps, cfg.window_ms);
+              prop.multiProcessorCount, blocks, cfg.warps, cc, cfg.window_ms);
   std::printf("msg: ldst=%llu KiB  tma=%llu KiB (stages=%d, dyn smem %zu B, "
               "static %zu B)\n\n",
               (unsigned long long)(cfg.msg >> 10),
@@ -532,8 +553,15 @@ int main(int argc, char** argv) {
   std::printf("[note] same clock caveats as interference_matrix; S_intra is\n"
               "       clean by construction (baseline runs seconds apart).\n\n");
 
-  // One measured run; returns aggregate compute rate (unit/s) and comm GB/s.
-  auto run = [&](int pid, int cid, int cw, double* comm_gbps) -> double {
+  // One measured run. Compute rates are split into the comm-carrying CTA
+  // group (blk < cc) and the pure-compute group (blk >= cc); when cc ==
+  // blocks the pure group is empty.
+  struct RunOut {
+    double comm_gbps = 0;
+    double comp_comm = 0;  // aggregate compute rate, comm-carrying CTAs
+    double comp_pure = 0;  // aggregate compute rate, pure CTAs
+  };
+  auto run = [&](int pid, int cid, int cw) -> RunOut {
     const uint64_t msg_vec = (cid == kCommTma ? tma_msg : cfg.msg) / 16;
     const size_t dyn = cid == kCommTma ? tma_dyn(tma_msg) : 0;
     if (dyn > 0)
@@ -543,8 +571,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_cnt, 0, cnt_n * sizeof(unsigned long long)));
     CUDA_CHECK(cudaDeviceSynchronize());
     fused_kernel<<<blocks, threads, dyn, s_kernel>>>(
-        pid, cid, cw, d_stop, d_cnt, csrc, cdst, cbuf_vec, (uint32_t)msg_vec,
-        psrc, pdst, pbuf_vec, (uint32_t)cfg.stages, tma_stride);
+        pid, cid, cw, cc, d_stop, d_cnt, csrc, cdst, cbuf_vec,
+        (uint32_t)msg_vec, psrc, pdst, pbuf_vec, (uint32_t)cfg.stages,
+        tma_stride);
     CUDA_CHECK(cudaGetLastError());
     sleep_ms(50);
     std::vector<unsigned long long> a(cnt_n), b(cnt_n);
@@ -567,39 +596,45 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaStreamSynchronize(s_kernel));
     const double win = std::chrono::duration<double>(t1 - t0).count();
 
-    double compute = 0, comm_bytes = 0;
+    RunOut o;
+    double comm_bytes = 0, comp_c = 0, comp_p = 0;
     for (int blk = 0; blk < blocks; ++blk)
       for (int w = 0; w < cfg.warps; ++w) {
         const double d = (double)(b[blk * kMaxWarps + w] - a[blk * kMaxWarps + w]);
-        if (w < cw)
+        if (w < cw && blk < cc)
           comm_bytes += d * (double)(msg_vec * 16);
+        else if (blk < cc)
+          comp_c += d * probe_work_per_iter(pid);
         else
-          compute += d * probe_work_per_iter(pid);
+          comp_p += d * probe_work_per_iter(pid);
       }
-    *comm_gbps = comm_bytes / win / 1e9;
-    return compute / win;
+    o.comm_gbps = comm_bytes / win / 1e9;
+    o.comp_comm = comp_c / win;
+    o.comp_pure = comp_p / win;
+    return o;
   };
 
   FILE* csv = nullptr;
   if (!cfg.csv.empty()) {
     csv = std::fopen(cfg.csv.c_str(), "a");
     if (csv)
-      std::fprintf(csv, "probe,comm,warps,comm_warps,msg_bytes,comm_gbps,"
-                   "full,base,ovl,unit,S_warp,S_intra\n");
+      std::fprintf(csv, "probe,comm,warps,comm_warps,comm_ctas,msg_bytes,"
+                   "comm_gbps,full,base,ovl,unit,S_warp,S_intra,S_pure\n");
   }
 
-  std::printf("%-5s %-5s %3s | %10s | %11s %11s %11s %8s | %7s %7s\n", "probe",
-              "comm", "cw", "comm(GB/s)", "full", "base", "overlap", "unit",
-              "S_warp", "S_intra");
+  const bool split = cc < blocks;
+  std::printf("%-5s %-5s %3s | %10s | %11s %11s %11s %8s | %7s %7s %7s\n",
+              "probe", "comm", "cw", "comm(GB/s)", "full", "base", "overlap",
+              "unit", "S_warp", "S_intra", "S_pure");
 
-  // Full-strength reference (C=0) per probe.
-  std::map<int, double> full_rate;
+  // Full-strength (C=0) and ceded-but-idle baselines, cached per config.
+  std::map<int, RunOut> full_rate;
+  std::map<std::pair<int, int>, RunOut> base_rate;
 
   for (const auto& pname : cfg.probes) {
     const int pid = probe_id_of(pname);
     if (pid < 0) { std::printf("unknown probe %s\n", pname.c_str()); continue; }
-    double dummy = 0;
-    full_rate[pid] = run(pid, kCommNone, 0, &dummy);
+    full_rate[pid] = run(pid, kCommNone, 0);
 
     for (const auto& cname : cfg.comms) {
       const int cid = cname == "tma" ? kCommTma : kCommLdst;
@@ -610,24 +645,37 @@ int main(int argc, char** argv) {
       }
       for (int cw : cfg.comm_warps) {
         if (cw < 1 || cw >= cfg.warps) continue;
-        double base_comm = 0, ovl_comm = 0;
-        const double base = run(pid, kCommNone, cw, &base_comm);
-        const double ovl = run(pid, cid, cw, &ovl_comm);
-        const double s_warp = base > 0 ? full_rate[pid] / base : 0;
-        const double s_intra = ovl > 0 ? base / ovl : 0;
+        auto bkey = std::make_pair(pid, cw);
+        if (!base_rate.count(bkey)) base_rate[bkey] = run(pid, kCommNone, cw);
+        const RunOut& base = base_rate[bkey];
+        const RunOut ovl = run(pid, cid, cw);
+
+        // full/base/overlap and the ratios describe the comm-carrying CTAs;
+        // S_pure is the collateral damage on the CTAs with no comm warps.
+        const double s_warp =
+            base.comp_comm > 0 ? full_rate[pid].comp_comm / base.comp_comm : 0;
+        const double s_intra =
+            ovl.comp_comm > 0 ? base.comp_comm / ovl.comp_comm : 0;
+        const double s_pure =
+            ovl.comp_pure > 0 ? base.comp_pure / ovl.comp_pure : 0;
         const double sc = probe_scale(pid);
         std::printf("%-5s %-5s %3d | %10.2f | %11.1f %11.1f %11.1f %8s |"
-                    " %7.3f %7.3f\n",
-                    pname.c_str(), cname.c_str(), cw, ovl_comm,
-                    full_rate[pid] / sc, base / sc, ovl / sc, probe_unit(pid),
-                    s_warp, s_intra);
+                    " %7.3f %7.3f",
+                    pname.c_str(), cname.c_str(), cw, ovl.comm_gbps,
+                    full_rate[pid].comp_comm / sc, base.comp_comm / sc,
+                    ovl.comp_comm / sc, probe_unit(pid), s_warp, s_intra);
+        if (split) std::printf(" %7.3f\n", s_pure);
+        else std::printf(" %7s\n", "-");
         std::fflush(stdout);
         if (csv)
-          std::fprintf(csv, "%s,%s,%d,%d,%llu,%.3f,%.1f,%.1f,%.1f,%s,%.4f,%.4f\n",
-                       pname.c_str(), cname.c_str(), cfg.warps, cw,
+          std::fprintf(csv,
+                       "%s,%s,%d,%d,%d,%llu,%.3f,%.1f,%.1f,%.1f,%s,%.4f,%.4f,"
+                       "%.4f\n",
+                       pname.c_str(), cname.c_str(), cfg.warps, cw, cc,
                        (unsigned long long)(cid == kCommTma ? tma_msg : cfg.msg),
-                       ovl_comm, full_rate[pid] / sc, base / sc, ovl / sc,
-                       probe_unit(pid), s_warp, s_intra);
+                       ovl.comm_gbps, full_rate[pid].comp_comm / sc,
+                       base.comp_comm / sc, ovl.comp_comm / sc, probe_unit(pid),
+                       s_warp, s_intra, split ? s_pure : 0.0);
       }
     }
   }
@@ -638,6 +686,8 @@ int main(int argc, char** argv) {
       "S_intra = base / ovl  : dynamic cost of LIVE communication at the same\n"
       "                        warp count -- issue slots, LSU/MIO, memory\n"
       "                        pipeline shared inside the SM\n"
+      "S_pure  = same ratio for CTAs carrying NO comm warps (only with\n"
+      "                        --comm-ctas < blocks); isolates cross-SM spill\n"
       "comm(GB/s) is what those warps bought you in return.\n");
 
   if (csv) std::fclose(csv);

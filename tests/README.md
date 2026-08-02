@@ -251,3 +251,12 @@ nvidia-smi -rgc
 1. CE 天然没有这张表——它不可能出现在 CTA 里,intra-SM 干扰恒为零;这张表量化的正是 SM 驻留方案相对 CE 多付的那部分。
 2. 每 SM 只有一个 CTA(模拟 FlashAttention 风格的融合 kernel),计算探针的绝对吞吐低于 `interference_matrix` 里满占用的版本,横向对比只看比值。
 3. tma 的 staging smem 会挤占融合 kernel 的 smem 预算,这个静态代价体现在打印出的 dyn smem 数字上,不在 S_intra 里。
+
+### v2 修正(第一轮数据暴露的问题)
+
+第一轮 RTX5000 数据出现了"纯寄存器的 mma 探针被 1 个 tma warp 拖慢 5 倍,且对消息大小敏感"的异常,定位为两个混杂因素,已修:
+
+1. **测量循环污染**:探针每次迭代做一次 stop-flag load + publish store,在 P2P backpressure 顶满 SM 访存端口时,这两条测量用访存指令把纯计算探针变成被访存延迟 gate 的循环。修复:寄存器探针每 `kCheckBatch=16` 次迭代才碰一次内存。
+2. **极端 backpressure 配置**:默认所有 CTA 都带通信 warp,数百个 warp 分一条链路,每个通信 warp 大部分时间在 stall/spin,测到的是"堵死的通信 warp 有多吵"。修复:tma 自旋加 `__nanosleep`(礼貌自旋,生产 kernel 的标准做法);新增 `--comm-ctas N` 只让前 N 个 CTA 带通信 warp,其余纯计算 CTA 单独报告 `S_pure` 列——它同时量化了"通信 CTA 的 backpressure 会不会溢出到没有通信 warp 的 SM"(经由共享的 L2/内存端口)。
+
+注意:backpressure 拥塞 SM 访存端口、连累同 SM 所有 warp 访存延迟,这是 intra-SM 特有的真实干扰通道(计算 warp 必然访存,躲不开);v2 只是不再让它被错误记到纯寄存器探针头上。对比 `--comm-ctas 8` 与默认全 CTA 两种跑法的 S_intra,可以分离"稳态资源共享"与"backpressure 拥塞"两种成分。
