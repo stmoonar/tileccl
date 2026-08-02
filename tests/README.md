@@ -161,7 +161,7 @@ TMA 消息上限:消费卡 smem 远小于 H100 的 227 KB,`--msg` 装不下 ≥3
 
 ### 结果解读与前提
 
-1. **先锁频**:`nvidia-smi -lgc <min>,<max>`(需要 root/管理员)。通信+计算同时跑功耗上升,DVFS 降频会被误读成资源竞争。程序启动时会打印提醒;消费卡锁不了频的话,至少记录 `nvidia-smi --query-gpu=clocks.sm` 并在报告里注明。
+1. **锁频最好,锁不了也有办法**:`nvidia-smi -lgc` 需要宿主机层面的权限(容器内 root 通常不够)。不锁频时用三件事替代:(a) 看内置 sanity 行——`ce` x `mma`/`ffma`/`l2`/`smem` 理应是 1.00/1.00,降频会不分行地拖慢一切,这几行不是 1.00 就说明该 run 被 DVFS 污染;(b) 旁路采样 `nvidia-smi --query-gpu=clocks.sm,temperature.gpu,power.draw --format=csv,noheader -lms 500 > clocks.log` 留档;(c) 加 `--no-alone-cache`,让每格的 alone 基线与 overlap 背靠背相邻测量,抵消热漂移(run 时间约翻倍)。
 2. **CTA 布局是尽力而为**:没有 green context 的话,probe 和 comm 的 CTA 不保证落在不相交的 SM 上,`S_c` 里可能混入同 SM 的 warp 调度竞争。要硬分区可以在 H20(CUDA >= 12.4)上用 green context 改造。
 3. 预期的模式(用来校验数据是否合理):`ce` x `mma`/`ffma`/`smem` 应接近 1.0(CE 不碰 SM,也不碰这些资源);`ce`/`tma`/`reg` x `hbm` 都应明显 > 1(源端 HBM 读竞争不可避免);`reg` 行的 `S_c` 应普遍高于 `tma` 行(通信 warp 抢 issue slot 和 LSU);`l2` 行反映链路流量对 L2 的污染。
 4. matrix 模式不做数据校验(pk_bw_sweep 已经验证过同样的搬运 kernel);starve 模式下 `under-squat` 时间对饿死的方法约等于 squatter 存活时间,不是传输本身的时间。

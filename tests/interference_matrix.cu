@@ -397,6 +397,7 @@ struct Config {
   int dst_dev = 1;
   std::string probe_dev = "src";  // src | dst
   std::string csv;                // optional csv output path
+  bool alone_cache = true;        // reuse probe-alone baselines across cells
 };
 
 static uint64_t parse_bytes(const std::string& s) {
@@ -446,7 +447,11 @@ static void usage(const char* prog) {
       "  --probe-dev D     src | dst -- where the probe runs (default src;\n"
       "                    dst measures receiver-side interference)\n"
       "  --src N / --dst N GPU indices (default 0 / 1)\n"
-      "  --csv PATH        also append machine-readable rows to PATH\n",
+      "  --csv PATH        also append machine-readable rows to PATH\n"
+      "  --no-alone-cache  re-measure the probe-alone baseline right before\n"
+      "                    every overlap run (use when clocks are not locked:\n"
+      "                    back-to-back measurement cancels thermal/DVFS\n"
+      "                    drift at the cost of ~2x runtime)\n",
       prog);
 }
 
@@ -477,6 +482,7 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--src") c.src_dev = std::atoi(next().c_str());
     else if (a == "--dst") c.dst_dev = std::atoi(next().c_str());
     else if (a == "--csv") c.csv = next();
+    else if (a == "--no-alone-cache") c.alone_cache = false;
     else if (a == "-h" || a == "--help") { usage(argv[0]); std::exit(0); }
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
@@ -843,7 +849,7 @@ int main(int argc, char** argv) {
     auto probe_alone_rate = [&](const std::string& probe, int blocks) {
       auto key = std::make_pair(probe, blocks);
       auto it = alone_cache.find(key);
-      if (it != alone_cache.end()) return it->second;
+      if (cfg.alone_cache && it != alone_cache.end()) return it->second;
       probe_launch(probe, &probe_ctx, blocks);
       sleep_ms(50);  // settle
       std::vector<unsigned long long> a, b;
