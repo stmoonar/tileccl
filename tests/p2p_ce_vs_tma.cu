@@ -474,6 +474,7 @@ struct Result {
   bool ok = false;
   double avg_us = 0;     // back-to-back, device time / iters
   double p50_us = 0;     // one-shot latency, median
+  double p99_us = 0;     // one-shot latency, tail (p99, or max for few samples)
   double gbps = 0;       // from avg_us
   int verify = -1;       // -1 skipped, 0 mismatch, 1 ok
   std::string note;
@@ -518,6 +519,8 @@ static bool time_transfer(Launch&& launch, uint64_t bytes, cudaStream_t stream,
   }
   std::sort(lat.begin(), lat.end());
   out->p50_us = lat[lat.size() / 2];
+  // Tail latency: the number a fused pipeline's consumer actually waits on.
+  out->p99_us = lat[std::min(lat.size() - 1, lat.size() * 99 / 100)];
 
   CUDA_CHECK(cudaEventDestroy(beg));
   CUDA_CHECK(cudaEventDestroy(end));
@@ -773,18 +776,18 @@ int main(int argc, char** argv) {
                 (unsigned long long)tokens, bytes / 1048576.0, ts.tile_bytes,
                 tile_desc.c_str(), ts.num_tiles, ts.stages, ts.blocks,
                 ts.smem_bytes);
-    std::printf("%-11s %12s %12s %12s %8s\n", "method", "avg(us)", "p50(us)",
-                "BW(GB/s)", "verify");
+    std::printf("%-11s %12s %12s %12s %12s %8s\n", "method", "avg(us)",
+                "p50(us)", "p99(us)", "BW(GB/s)", "verify");
 
     auto report = [&](const char* name, const Result& r) {
       if (!r.ok) {
-        std::printf("%-11s %12s %12s %12s %8s  %s\n", name, "-", "-", "-", "-",
-                    r.note.empty() ? "failed" : r.note.c_str());
+        std::printf("%-11s %12s %12s %12s %12s %8s  %s\n", name, "-", "-", "-",
+                    "-", "-", r.note.empty() ? "failed" : r.note.c_str());
         return;
       }
       const char* v = r.verify < 0 ? "skip" : (r.verify ? "ok" : "MISMATCH");
-      std::printf("%-11s %12.2f %12.2f %12.2f %8s%s%s\n", name, r.avg_us,
-                  r.p50_us, r.gbps, v, r.note.empty() ? "" : "  ",
+      std::printf("%-11s %12.2f %12.2f %12.2f %12.2f %8s%s%s\n", name, r.avg_us,
+                  r.p50_us, r.p99_us, r.gbps, v, r.note.empty() ? "" : "  ",
                   r.note.c_str());
     };
 
