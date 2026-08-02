@@ -260,3 +260,37 @@ nvidia-smi -rgc
 2. **极端 backpressure 配置**:默认所有 CTA 都带通信 warp,数百个 warp 分一条链路,每个通信 warp 大部分时间在 stall/spin,测到的是"堵死的通信 warp 有多吵"。修复:tma 自旋加 `__nanosleep`(礼貌自旋,生产 kernel 的标准做法);新增 `--comm-ctas N` 只让前 N 个 CTA 带通信 warp,其余纯计算 CTA 单独报告 `S_pure` 列——它同时量化了"通信 CTA 的 backpressure 会不会溢出到没有通信 warp 的 SM"(经由共享的 L2/内存端口)。
 
 注意:backpressure 拥塞 SM 访存端口、连累同 SM 所有 warp 访存延迟,这是 intra-SM 特有的真实干扰通道(计算 warp 必然访存,躲不开);v2 只是不再让它被错误记到纯寄存器探针头上。对比 `--comm-ctas 8` 与默认全 CTA 两种跑法的 S_intra,可以分离"稳态资源共享"与"backpressure 拥塞"两种成分。
+
+---
+
+## pipeline_e2e:实验 D,端到端验证成本模型
+
+前面所有工具产出的都是**成本模型的参数**;这个工具验证**模型本身**:一个合成 producer → transfer → consumer 融合 pipeline 跨两卡跑,对每个 (方法, 算术强度) 组合测四个量,并当场对比理想稳态模型的预测:
+
+- `Tc_src`:只生产(同样的计算,tile 写到**本地**);
+- `Tm`:只传输(intensity=0,只有 seed + store);
+- `Tc_dst`:只消费(flag 预置、buffer 预填);
+- `To`:全流水的双卡 wall clock;
+- `pred = max(Tc_src, Tm, Tc_dst)`,`err% = (To − pred) / pred`。
+
+`err%` 就是模型没解释掉的时间——干扰、流水 fill/drain、同步开销。预期签名:两端(强 comm-bound / 强 compute-bound)err 小,交叉点(Tc ≈ Tm)附近有一个 bump。err 大且系统性偏正的格子,说明干扰矩阵里对应的 S 因子必须进模型。
+
+三种传输方法对应"产出的 tile 在哪"的三条通路,消费者对所有方法完全相同(acquire-poll flag → FMA 链 → sink):
+
+| method | 生产侧路径 | 同步 |
+|---|---|---|
+| `ce` | register → local gmem staging → 分 chunk `cudaMemcpyPeerAsync` | stream/event 依赖链 |
+| `ldst` | register → **直写 peer gmem**,零本地 staging | 每 tile 一个 `st.release.sys` flag |
+| `tma` | register → smem(双缓冲)→ `cp.async.bulk` → peer gmem | flag 在 bulk group 完成后释放(滞后一个 tile) |
+
+校验:每个 tile 的 element 0 由消费者按生产者的公式重算比对,`verify` 列报告。
+
+```bash
+./pipeline_e2e                                          # 三方法 x 强度 0..4096
+./pipeline_e2e --methods ldst,tma --intensity 0,256,1024,4096
+./pipeline_e2e --total 128M --tile 16K --csv e2e.csv
+```
+
+主要参数:`--intensity`(每 float 的 FMA 数,FLOP/byte = intensity/2;交叉点位置 ≈ 计算吞吐/链路带宽,PCIe 上在 1000+,NVLink 上会低得多)、`--tile`(默认 16K,tma 需要 2×tile 装进 smem)、`--chunks`(ce 流水段数,默认 16)、`--reps`(取最小值,默认 3)。
+
+读法:先看 `verify` 全 ok(说明 flag 语义和传输路径正确);再看每列 To 随强度的走向——低强度贴 Tm、高强度贴 Tc,交叉点两侧谁的 To 低,谁就是该强度区间的正确融合方式;最后看 err% 的分布,决定成本模型要不要加干扰修正项。
