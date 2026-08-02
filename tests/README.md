@@ -140,12 +140,14 @@ ce                 ...          ...          ...        ok
 - `S_c` = probe alone rate / overlap rate:通信把计算拖慢的倍数;
 - 探针在 overlap 窗口内计数增量为 0 会打 `[!]`:说明两者根本没有并发(结果无效)。
 
-CTA 布局:probe 与 comm kernel 同卡时,probe 拿 (SM 数 - `--comm-sms`) 个 CTA;`ce` 行 probe 拿全部 SM——这正是 CE 的卖点,也是为什么 `ce` 行的 `S_c` 是纯 memory 系统竞争,而 `tma`/`reg` 行的 `S_c` 还包含让出的 CTA。
+CTA 布局:probe 与 comm kernel 同卡时,probe 拿 (SM 数 - `--comm-sms`) 个 CTA;`ce` 行 probe 拿全部 SM——这正是 CE 的卖点。注意 `S_c` 的 alone 基线用与 overlap **相同的 CTA 数**测得,所以 `S_c` 只反映 memory/pipe 竞争;把 CTA 让给通信的机会成本单独体现在 `ce` 行与 `tma`/`reg` 行 alone 列的差值上(compute-bound 探针上应近似 comm-sms/SM 数的线性损失,HBM-bound 探针上可能近似为零甚至为负)。
+
+TMA 消息上限:消费卡 smem 远小于 H100 的 227 KB,`--msg` 装不下 ≥3 级流水时程序自动把 tma 的消息折半到能装下为止,并打印实际值;tma 行的带宽按实际搬运字节数计算。
 
 ### 两种模式
 
 - `--mode matrix`(默认):上述干扰矩阵。
-- `--mode starve`:实验 C。一个满占用(SM x 4 个 CTA)的 ffma kernel 常驻源卡,再让每种搬运方式发一次 payload。预期:`ce` 照常完成;`tma`/`reg` 拿不到 CTA slot,饿死到 squatter 退出为止。这是三者 progress model 的本质差别,带宽曲线看不出来。
+- `--mode starve`:实验 C。一个满占用的 ffma kernel 常驻源卡(CTA 数由 occupancy API 算出,占满每个 SM 的全部 CTA slot——只占部分 slot 的话 comm kernel 仍能 co-schedule,测不到饿死),再让每种搬运方式发一次 payload。预期:`ce` 照常完成;`tma`/`reg` 拿不到 CTA slot,饿死到 squatter 退出为止。这是三者 progress model 的本质差别,带宽曲线看不出来。
 
 ```bash
 ./interference_matrix                                  # 全矩阵

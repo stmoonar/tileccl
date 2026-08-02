@@ -752,15 +752,27 @@ int main(int argc, char** argv) {
     smem_budget = (size_t)v;
   }
 
-  // TMA plan for the chosen message size.
-  TmaPlan tma_plan = plan_tma((uint32_t)cfg.msg, cfg.stages, smem_budget);
+  // TMA plan: cap the message at the largest size whose >=3-stage pipeline
+  // fits the smem budget. Consumer parts have far less than H100's 227 KB, so
+  // the shared default (--msg 2M) would otherwise wipe out the whole column.
+  uint64_t tma_msg = cfg.msg;
+  TmaPlan tma_plan = plan_tma((uint32_t)tma_msg, cfg.stages, smem_budget);
+  while (!tma_plan.ok && tma_msg >= 32 && tma_msg % 32 == 0) {
+    tma_msg /= 2;
+    tma_plan = plan_tma((uint32_t)tma_msg, cfg.stages, smem_budget);
+  }
   TmaKernel tma_k = tma_plan.ok ? pick_tma_kernel(tma_plan.stages) : nullptr;
   if (tma_k) {
     CUDA_CHECK(cudaSetDevice(cfg.src_dev));
     CUDA_CHECK(cudaFuncSetAttribute(
         tma_k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)tma_plan.smem));
+    if (tma_msg != cfg.msg)
+      std::printf("[tma] msg capped to %llu KiB to fit shared memory\n\n",
+                  (unsigned long long)(tma_msg >> 10));
   }
   const uint32_t num_msgs = (uint32_t)(cfg.total / cfg.msg);
+  const uint32_t tma_num_msgs = (uint32_t)(cfg.total / tma_msg);
+  const uint64_t tma_bytes = (uint64_t)tma_num_msgs * tma_msg;
 
   // One launch = one full payload through the given mover.
   auto comm_launch = [&](const std::string& comm, cudaStream_t s) {
@@ -769,9 +781,10 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyPeerAsync(d_dst + off, cfg.dst_dev, d_src + off,
                                        cfg.src_dev, cfg.msg, s));
     } else if (comm == "tma") {
-      const int blocks = std::min<uint32_t>((uint32_t)cfg.comm_sms, num_msgs);
+      const int blocks = std::min<uint32_t>((uint32_t)cfg.comm_sms, tma_num_msgs);
       tma_k<<<blocks, kTmaThreads, tma_plan.smem, s>>>(
-          d_src, d_dst, cfg.total, (uint32_t)cfg.msg, tma_plan.stride, num_msgs);
+          d_src, d_dst, tma_bytes, (uint32_t)tma_msg, tma_plan.stride,
+          tma_num_msgs);
     } else if (comm == "reg") {
       reg_p2p_kernel<<<cfg.comm_sms, cfg.reg_threads, 0, s>>>(
           reinterpret_cast<const uint4*>(d_src),
@@ -782,8 +795,14 @@ int main(int argc, char** argv) {
 
   auto comm_available = [&](const std::string& comm, std::string* why) {
     if (comm != "ce" && !can_peer) { *why = "needs P2P"; return false; }
-    if (comm == "tma" && !tma_k) { *why = "msg > smem budget"; return false; }
+    if (comm == "tma" && !tma_k) { *why = "no tma plan fits smem"; return false; }
     return true;
+  };
+
+  // tma may move slightly less than --total when the capped message does not
+  // divide it; bandwidth must be computed over the bytes actually moved.
+  auto comm_bytes = [&](const std::string& comm) -> uint64_t {
+    return comm == "tma" ? tma_bytes : cfg.total;
   };
 
   // Timed run of `iters` payloads; returns average us per payload.
@@ -857,7 +876,8 @@ int main(int argc, char** argv) {
       int iters = (int)std::max(3.0, cfg.window_ms * 1000.0 / warm_us);
       iters = std::min(iters, 20000);
       const double alone_us = comm_time_us(comm, iters);
-      const double alone_gbps = (double)cfg.total / (alone_us * 1e-6) / 1e9;
+      const double alone_gbps =
+          (double)comm_bytes(comm) / (alone_us * 1e-6) / 1e9;
 
       // Probe CTA count: full device, minus comm CTAs when they share it.
       const bool share =
@@ -885,7 +905,8 @@ int main(int argc, char** argv) {
         const double win_s = std::chrono::duration<double>(t1 - t0).count();
         unsigned long long delta = 0;
         const double rate_ovl = probe_rate(probe, probe_ctx, a, b, win_s, &delta);
-        const double ovl_gbps = (double)cfg.total / (ovl_us * 1e-6) / 1e9;
+        const double ovl_gbps =
+            (double)comm_bytes(comm) / (ovl_us * 1e-6) / 1e9;
 
         const double scale = probe_unit_scale(probe);
         const double s_m = ovl_gbps > 0 ? alone_gbps / ovl_gbps : 0;
@@ -903,23 +924,40 @@ int main(int argc, char** argv) {
                        "%.1f,%s,%.3f\n",
                        probe.c_str(), comm.c_str(), cfg.probe_dev.c_str(),
                        pblocks, comm == "ce" ? 0 : cfg.comm_sms,
-                       (unsigned long long)cfg.msg, alone_gbps, ovl_gbps, s_m,
+                       (unsigned long long)(comm == "tma" ? tma_msg : cfg.msg),
+                       alone_gbps, ovl_gbps, s_m,
                        rate_alone / scale, rate_ovl / scale, probe_unit(probe),
                        s_c);
       }
     }
     std::printf(
         "\nS_m = comm slowdown under compute; S_c = compute slowdown under comm.\n"
-        "S_c for 'ce' rows is the pure memory-system cost (no SM sharing);\n"
-        "for tma/reg it also includes losing %d CTAs to the mover.\n\n",
+        "S_c is measured against a probe baseline with the SAME CTA count, so\n"
+        "it isolates memory/pipe contention. The opportunity cost of ceding %d\n"
+        "CTAs to the tma/reg movers shows up separately, as the gap in the\n"
+        "probe 'alone' column between the ce row and the tma/reg rows.\n\n",
         cfg.comm_sms);
   }
 
   // ---- experiment C: starvation -------------------------------------------
 
   if (cfg.mode == "starve" || cfg.mode == "both") {
-    std::printf("--- starvation: full-occupancy ffma squatter on GPU %d, "
-                "deadline %.0f ms ---\n", cfg.src_dev, cfg.starve_ms);
+    // The squatter must occupy every CTA slot, not just every SM: any
+    // residual slot (threads, registers) lets the comm kernel co-schedule and
+    // the starvation test silently measures nothing. Ask the occupancy API
+    // for the true CTAs-per-SM limit of the ffma probe.
+    int ffma_ctas_per_sm = 0;
+    CUDA_CHECK(cudaSetDevice(cfg.src_dev));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &ffma_ctas_per_sm, probe_ffma_kernel, kProbeThreads, 0));
+    if (ffma_ctas_per_sm < 1) ffma_ctas_per_sm = 1;
+    const int squat_blocks = std::min(
+        psrc.multiProcessorCount * ffma_ctas_per_sm, kMaxProbeBlocks);
+
+    std::printf("--- starvation: full-occupancy ffma squatter on GPU %d "
+                "(%d CTAs = %d/SM x %d SMs), deadline %.0f ms ---\n",
+                cfg.src_dev, squat_blocks, ffma_ctas_per_sm,
+                psrc.multiProcessorCount, cfg.starve_ms);
     std::printf("%-5s %14s %16s   %s\n", "comm", "alone(us)", "under-squat(us)",
                 "verdict");
 
@@ -930,8 +968,6 @@ int main(int argc, char** argv) {
     } else {
       probe_ctx_init(&squat, cfg.src_dev, 1 << 20, psrc.l2CacheSize);
     }
-    const int squat_blocks =
-        std::min(psrc.multiProcessorCount * 4, kMaxProbeBlocks);
 
     for (const auto& comm : cfg.comms) {
       std::string why;
