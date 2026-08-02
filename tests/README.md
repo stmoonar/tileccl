@@ -294,3 +294,18 @@ nvidia-smi -rgc
 主要参数:`--intensity`(每 float 的 FMA 数,FLOP/byte = intensity/2;交叉点位置 ≈ 计算吞吐/链路带宽,PCIe 上在 1000+,NVLink 上会低得多)、`--tile`(默认 16K,tma 需要 2×tile 装进 smem)、`--chunks`(ce 流水段数,默认 16)、`--reps`(取最小值,默认 3)。
 
 读法:先看 `verify` 全 ok(说明 flag 语义和传输路径正确);再看每列 To 随强度的走向——低强度贴 Tm、高强度贴 Tc,交叉点两侧谁的 To 低,谁就是该强度区间的正确融合方式;最后看 err% 的分布,决定成本模型要不要加干扰修正项。
+
+---
+
+## plot_interference.py:干扰与同步开销图集
+
+与 `plot_pk_bw.py` 同风格:两台机器的实测数据内嵌在脚本里,重跑工具后把新数字贴回去即可刷新。`python plot_interference.py --out figs` 生成六张图:
+
+| 图 | 内容 |
+|---|---|
+| `if_sc_heatmap.png` | S_c 热图(2 平台 x 收发两侧):通信把计算拖慢多少。全图唯一的大格子是 NVLink 的 L2 污染 |
+| `if_sm_heatmap.png` | S_m 热图(发送侧):计算把通信拖慢多少。PCIe 上 CE 最脆,NVLink 上欠配置的 SM 系最脆 |
+| `if_sm_sweep.png` | S_m 与 alone 带宽随通信 SM 数的变化:健壮性 = bytes-in-flight,配置到饱和点即免疫 |
+| `if_intra.png` | intra-SM:S_intra(全员 vs 集中两种形态)+ S_warp(静态让 warp 代价) |
+| `if_sync.png` | 同步原语:producer 序列成本、release flag vs fence 的边际开销、单向延迟/远端 atomic 参考线 |
+| `if_starve.png` | starvation:满占用计算 kernel 下只有 CE 能独立进展 |
