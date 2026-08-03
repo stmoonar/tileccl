@@ -1,6 +1,6 @@
 # P2P microbench
 
-四个独立的可执行文件，`make` 一次全部构建：
+七个独立的可执行文件，`make` 一次全部构建：
 
 | binary | 回答的问题 |
 |---|---|
@@ -9,6 +9,8 @@
 | `interference_matrix` | 通信对计算、计算对通信的**双向干扰矩阵**(通信方式 x 计算瓶颈类型),以及满载 SM 下三种搬运方式的 progress/starvation 行为 |
 | `sync_cost` | 细粒度 pipeline 的同步原语成本:跨卡 flag 单向延迟、fence+signal 尾部开销、远端 atomic 往返、本地 mbarrier 周期 |
 | `intra_sm_matrix` | **SM 内部**(warp-specialized 融合)的通算干扰:通信 warp 和计算 warp 同 CTA 时,issue slot / LSU / 内存管线的动态竞争与让出 warp 的静态代价 |
+| `pipeline_e2e` | 端到端验证成本模型:合成 producer → transfer → consumer pipeline 的实测 vs 稳态模型预测 |
+| `ce_gemm_overlap` | CE 在另一条 stream 上搬数据时,一个**数据不相关的真实 cuBLAS GEMM** 每迭代慢多少(S_c),反过来 GEMM 压满时 CE 掉多少带宽(S_m) |
 
 ---
 
@@ -211,6 +213,9 @@ nvidia-smi topo -m
 ./interference_matrix --probe-dev dst --csv im_dst.csv
 ./interference_matrix --mode starve
 
+# 3b. 真实 GEMM 视角的 CE 干扰(对照组齐全跑一遍)
+./ce_gemm_overlap --comms p2p,d2d,h2d,d2h --csv ce_gemm.csv
+
 # 4. 解锁
 nvidia-smi -rgc
 ```
@@ -218,6 +223,44 @@ nvidia-smi -rgc
 有了 1-3 的数据,融合成本模型可以写成:
 `T_fused ~= max(T_c x S_c(comm, bottleneck), T_m x S_m(comm, bottleneck)) + N_tiles x sync_cost`,
 再用真实 fused kernel 验证预测误差。
+---
+
+## ce_gemm_overlap:CE 拷贝对独立 GEMM 的代价
+
+`interference_matrix` 用合成探针回答"CE 抢走多少某类资源";这个工具改用**真实 cuBLAS GEMM**,以框架用户直接看到的形式回答同一个问题:两条 stream,一条跑 GEMM(数据与传输完全无关),一条跑 CE 拷贝,逐迭代 event 计时,对比单独跑:
+
+- `S_c` = 重叠时 GEMM 每迭代耗时 / 单独跑(1.00 = CE 对计算免费);
+- `S_m` = CE 单独带宽 / GEMM 压满时的带宽(phase B)。
+
+### 方法学
+
+- **phase A(主指标)**:host 用 event 环持续给 comm stream 补投拷贝(每 chunk ~10 ms、4 级深度),保证整个 GEMM 计时窗口内 CE 一直忙——与拷贝自身被拖慢多少无关。若窗口内观测到 comm stream 空转会打 `[!]` 标记,此时 S_c 只是下界。
+- **phase B(对称)**:换成 GEMM 侧用 event 环持续重发(每槽 ~5 ms 的一批),CE burst 用 event 计时,得到干净的 S_m。
+- 拷贝 offset 在 `--comm-buf`(默认 256M)里轮转,避免 CE 流量反复打在 L2 热线上。
+- 逐迭代分布报 mean / p95:p95 明显高于 mean 说明干扰不是均匀的"带宽税",而是有尾部(个别迭代被 DMA burst 撞上)。
+
+### comm 种类 = 对照组设计
+
+用来把"HBM/L2 带宽竞争"和"CE 引擎本身"两种解释分开:
+
+| kind | CE 流量 | 对 GEMM 所在卡 HBM 的压力 |
+|---|---|---|
+| `p2p` | `cudaMemcpyPeerAsync`(push / pull / bidir) | push 读本卡,pull 写本卡,bidir 双向 |
+| `d2d` | 本卡内 D2D 拷贝 | 读+写都在本卡,单位字节压力最大 |
+| `h2d` / `d2h` | pinned host ↔ 显存(PCIe) | 几乎不占本卡 HBM 带宽(对照) |
+
+若 S_c 只在 p2p/d2d 下显著大于 1、h2d/d2h 下 ≈1,则干扰来自内存系统竞争而非 CE 占用本身;GEMM 形状上,大方阵(compute-bound)与扁 K / 扁 N 形状(memory-bound)的 S_c 差异给出同一结论的另一条证据链。
+
+```bash
+./ce_gemm_overlap                                       # 方阵 1K..8K, p2p push
+./ce_gemm_overlap --sizes 4096,8192,8192x8192x128 --comms p2p,d2d,h2d
+./ce_gemm_overlap --dir bidir --msg 64M --csv ce_gemm.csv
+```
+
+主要参数:`--sizes`(N 或 MxNxK)、`--comms`、`--dir`(p2p 方向)、`--msg`(CE 消息大小)、`--dtype fp16|tf32|fp32`、`--gemm-dev src|dst`(dst = 测接收端)、`--window-ms`(计时窗口,默认 300 ms)、`--no-sm`(跳过 phase B)。
+
+与 `interference_matrix` 的 `ce × mma/hbm` 行互为印证:那边是驻留探针的速率法(无 launch 与波次尾部),这边是真实 GEMM 的时延法(包含 cuBLAS kernel 的真实访存模式和 wave 尾部)。构建需要链接 cuBLAS(Makefile 已处理)。
+
 ---
 
 ## intra_sm_matrix:SM 内部(warp-specialized 融合)的通算干扰

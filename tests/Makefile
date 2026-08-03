@@ -12,7 +12,7 @@ NVCC     ?= nvcc
 ARCH     ?= sm_120a
 NVCCFLAGS := -O3 -std=c++17 -lineinfo -arch=$(ARCH)
 
-TARGETS := p2p_ce_vs_tma pk_bw_sweep interference_matrix sync_cost intra_sm_matrix pipeline_e2e
+TARGETS := p2p_ce_vs_tma pk_bw_sweep interference_matrix sync_cost intra_sm_matrix pipeline_e2e ce_gemm_overlap
 
 .PHONY: all clean ptx
 
@@ -35,6 +35,9 @@ intra_sm_matrix: intra_sm_matrix.cu
 
 pipeline_e2e: pipeline_e2e.cu
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+ce_gemm_overlap: ce_gemm_overlap.cu
+	$(NVCC) $(NVCCFLAGS) -o $@ $< -lcublas
 
 # Handy when checking that cp.async.bulk actually survives to the final PTX.
 ptx: p2p_ce_vs_tma.cu pk_bw_sweep.cu
