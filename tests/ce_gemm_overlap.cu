@@ -52,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <string>
 #include <thread>
@@ -332,13 +333,19 @@ struct Gemm {
 
   // Enqueue warmup + a timed run; does NOT synchronize -- the caller decides
   // whether to just wait (alone) or to pump the comm stream meanwhile.
-  void enqueue_timed(int warm, int iters) {
+  // `tick` (if set) is called every 64 enqueues: submitting thousands of
+  // cuBLAS calls takes tens of ms of host time, longer than the comm pump's
+  // ring depth -- without ticking the pump here, CE drains at the start of
+  // the window for small shapes (observed as the '[!] CE went idle' flag).
+  void enqueue_timed(int warm, int iters,
+                     const std::function<void()>& tick = nullptr) {
     CUDA_CHECK(cudaSetDevice(dev));
     for (int i = 0; i < warm; ++i) enqueue_once();
     CUDA_CHECK(cudaEventRecord(e_beg, stream));
     for (int i = 0; i < iters; ++i) {
       enqueue_once();
       CUDA_CHECK(cudaEventRecord(ev[i], stream));
+      if (tick && (i & 63) == 63) tick();
     }
     CUDA_CHECK(cudaEventRecord(e_end, stream));
   }
@@ -777,7 +784,7 @@ int main(int argc, char** argv) {
       CommPump pump;
       pump.start(c, cal.chunk_msgs);
       const auto tA0 = std::chrono::steady_clock::now();
-      g.enqueue_timed(3, iters);
+      g.enqueue_timed(3, iters, [&] { pump.poll(); });
       while (cudaEventQuery(g.e_end) != cudaSuccess) {
         pump.poll();
         std::this_thread::yield();
