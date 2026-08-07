@@ -120,6 +120,53 @@ remote 下报错或塌速而 `nosmem` 正常，说明问题特定于 TMA 描述�
 存（flux 全程没有对远端做过 TMA store，此组合属于未踩过的路径 —— 这正是
 保留 `nosmem` 变体的原因）。
 
+## 实验三 v2：flux sm90 融合 GEMM+RS — `exp3_gemm_rs_fused`
+
+上面的 `exp3_epilogue_remote` 测的是"epilogue 直接远端写"（flux sm80 风
+格）；本实验把 **flux sm90 真实采用的设计**原样搬到 stock CUTLASS 4.6 上
+测：epilogue TMA-store 到**本地** + 逐 tile 置 system-scope flag，每个
+CTA 的 producer warpgroup 里两个空闲 warp 变成 RS Fetch / RS Reduce
+warp——Fetch 自旋等 peer 的 tile flag 然后 TMA 从 peer 拉到 smem，Reduce
+从 smem 读出后用 `red.global.add.noftz.v8.f16` 归约进本地 reduce buffer。
+通信完全在 GEMM kernel 内部，代价直接体现为 kernel 时间膨胀：
+
+```
+slowdown = t_fused / t_baseline    （baseline = 同配置 stock GEMM）
+```
+
+移植说明（对照 flux 源码）：
+
+- `rs_gemm_kernel_sm90.cuh`：CUTLASS 4.6 的 cooperative kernel 原文拷贝 +
+  重放 flux 的修改。4.6 里静态 persistent scheduler 下 CLC 调度 warp
+  （Warp1）和 MainloopAux warp 本来就空转，正好承载 flux 的两个 RS 角色。
+- flag 发布在 consumer warpgroup `store()` 之后完成（`tma_store_wait<0>`
+  + named barrier + system CAS 0→1），与 flux 放在 EVT AuxStore `end()`
+  里等价（同一批线程、同一同步序列），省掉了自定义 EVT 节点；比 flux 多
+  一次 named-barrier sync（保证所有 store 线程 retire 后才置 flag）。
+- tile 顺序用 flux `WorkIdxMSwizzler` 的 XOR swizzle（nnodes=1 折叠）：
+  rank r 在第 t 步生产 segment `s⊕r`，恰好是 rank `s⊕r` 第 t 步要拉取的
+  tile——生产与消费天然锁步。要求 world 为 2 的幂。
+- flux 强制 epilogue `StagesD=1`，这里保留 stock 的 stage 数（逐 tile
+  `tma_store_wait<0>` 已经起到同样的排空作用）；DMA smem 计入 mainloop
+  stage carveout，所以 fused kernel 的 mainloop stage 数可能比 baseline
+  少一档（程序会打印两者）。
+
+**多进程**：一进程一卡（`fork`），buffer 用 cudaIPC 交换（匿名共享 mmap
+传 handle），flux 式 device barrier-all 对齐各 rank 的每次迭代——与
+torchrun 部署形态一致，不需要 MPI/pybind11。四个 rank 对称执行：每张卡
+一边算自己的 GEMM 一边被其它三张卡拉取。仅支持 Linux。
+
+```bash
+make exp3_gemm_rs_fused
+./exp3_gemm_rs_fused --verify              # 先验证 RS 结果（fp32 参考 + 容差）
+./exp3_gemm_rs_fused --m 8192 --n 8192 --k 2048 --csv rs.csv
+```
+
+读法：`slowdn` 是融合通信的全部代价（2 个 warp 的 SM 驻留 + flag 同步 +
+NVLink 拉取 + 等最慢 peer 的尾部）。与 `exp3_epilogue_remote` 的
+remote/local 比值对照，可以回答"flux 在 sm90 上选 pull 而不是 epilogue
+远端写，赚了还是亏了"。
+
 ## 实现备注（对照 flux / CUDA 12.9）
 
 - flux 的 CE 拷贝是 `cudaMemcpyAsync(cudaMemcpyDefault)` 作用在 cudaIPC
