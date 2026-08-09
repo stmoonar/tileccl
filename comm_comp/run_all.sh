@@ -92,9 +92,10 @@ fi
 # ---------------------------------------------------------------------------
 run exp1_default 2400 ./exp1_ce_interference \
     --sizes "$SIZES1" --window-ms "$WIN" --csv "$OUT/exp1_default.csv"
+# --comm-buf 2G so the 256M point fits a slot even at world=8 (slot = buf/7)
 run exp1_msgsweep 2400 ./exp1_ce_interference \
     --sizes 8192 --patterns pull,allgather --msgs 1M,4M,16M,64M,256M \
-    --window-ms "$WIN" --csv "$OUT/exp1_msgsweep.csv"
+    --comm-buf 2G --window-ms "$WIN" --csv "$OUT/exp1_msgsweep.csv"
 
 # ---------------------------------------------------------------------------
 # exp2: AG+GEMM granularity sweep (verify first, then the sweeps)

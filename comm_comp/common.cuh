@@ -172,8 +172,15 @@ static __global__ void fill_half_kernel(__half* p, size_t n, uint32_t salt) {
   size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   const size_t step = (size_t)gridDim.x * blockDim.x;
   for (; i < n; i += step) {
-    const uint32_t h = ((uint32_t)i + salt) * 2654435761u;
-    p[i] = __float2half(((h >> 16) & 0xffffu) * (1.0f / 65536.0f) - 0.5f);
+    // full avalanche mixer (murmur3 finalizer). A single Knuth multiply is
+    // a Weyl sequence: A(i,k) and B(k,j) then correlate along k and GEMM
+    // outputs pick up an O(K) systematic component -- harmless for speed,
+    // but it wrecks numeric-tolerance checks downstream.
+    uint32_t h = (uint32_t)i + salt * 0x9E3779B9u;
+    h ^= h >> 16; h *= 0x85ebca6bu;
+    h ^= h >> 13; h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    p[i] = __float2half((h & 0xffffu) * (1.0f / 65536.0f) - 0.5f);
   }
 }
 

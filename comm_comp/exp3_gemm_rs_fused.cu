@@ -191,9 +191,13 @@ struct HalfPtrs {
   const __half* p[mproc::kMaxWorld];
 };
 
+// Reports the max RELATIVE deviation |ref - got| / (|ref| + 1). The kernel
+// accumulates in fp16 (red.global.add), the reference in fp32, so the
+// legitimate gap is ~world ulps of the running sum -- relative ~world*2^-11.
+// An absolute tolerance is a trap: it silently couples to the data scale.
 static __global__ void verify_kernel(HalfPtrs douts, const __half* reduce_buf,
                                      int world, int rank, long long m_seg,
-                                     long long N, float* max_diff) {
+                                     long long N, float* max_rel) {
   long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
   const long long total = m_seg * N;
   const long long step = (long long)gridDim.x * blockDim.x;
@@ -205,10 +209,10 @@ static __global__ void verify_kernel(HalfPtrs douts, const __half* reduce_buf,
       ref += __half2float(douts.p[p][(rank * m_seg + row) * N + col]);
     }
     const float got = __half2float(reduce_buf[i]);
-    local_max = fmaxf(local_max, fabsf(ref - got));
+    local_max = fmaxf(local_max, fabsf(ref - got) / (fabsf(ref) + 1.0f));
   }
   // positive floats compare like their bit patterns
-  atomicMax(reinterpret_cast<int*>(max_diff), __float_as_int(local_max));
+  atomicMax(reinterpret_cast<int*>(max_rel), __float_as_int(local_max));
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +419,7 @@ int main(int argc, char** argv) {
       if (csv)
         std::fprintf(csv,
                      "m,n,k,world,rank,base_us,base_p95,fused_us,fused_p95,"
-                     "slowdown,pull_gbps,max_diff\n");
+                     "slowdown,pull_gbps,max_rel_diff\n");
     }
     double worst = 0;
     for (int r = 0; r < world; ++r) {
@@ -426,9 +430,12 @@ int main(int argc, char** argv) {
           (double)(world - 1) / world * M * N * 2 / (f * 1e-6) / 1e9;
       const double vd = mp.shm->results[r][4];
       char ver[32];
+      // fp16 chain of `world` adds rounds at the ulp of the LARGEST running
+      // partial, so elements whose final sum is small can see a few percent
+      // relative deviation; a real protocol bug shows up as rel ~ 1.
       if (!cfg.verify) std::snprintf(ver, sizeof(ver), "-");
-      else std::snprintf(ver, sizeof(ver), "%s (%.3g)",
-                         vd <= 0.25 ? "ok" : "FAIL", vd);
+      else std::snprintf(ver, sizeof(ver), "%s (rel %.3g)",
+                         vd <= 0.05 ? "ok" : "FAIL", vd);
       std::printf("%4d | %12.1f %8.1f | %12.1f %8.1f | %8.3f %8.1f %9.1f | %s\n",
                   r, b, flop / (b * 1e-6) / 1e12, f, flop / (f * 1e-6) / 1e12,
                   slow, f - b, pull_gbps, ver);
