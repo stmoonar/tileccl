@@ -25,6 +25,20 @@ make -j3                             # nvcc -arch=sm_90a，CUDA >= 12.4，12.9 �
 nvidia-smi -lgc 1980 -i 0,1,2,3      # H800 图形时钟按机器实际上限调整
 ```
 
+## 一键跑全部实验 — `run_all.sh`
+
+```bash
+sudo nvidia-smi -lgc 1980 -i 0,1,2,3   # 先锁频（脚本只记录时钟，不改）
+./run_all.sh                            # 全量，约 20-40 分钟
+QUICK=1 ./run_all.sh                    # 快速版
+```
+
+编译 + 依次跑完全部实验（含 `--verify`），日志/CSV/环境快照（nvidia-smi
+拓扑、时钟、nvcc 版本、git commit）收进 `results_<时间戳>/` 并打包成
+zip（机器上没有 zip 则 tar.gz）。每个实验都有 timeout，某一项挂死（记为
+rc=124）或失败不影响其余项，结果见包内 `manifest.txt`；fused 实验超时后
+会自动清理残留的 rank 进程。把 zip 拿回来即可分析。
+
 ## 实验一：CE 搬运对独立 GEMM 的影响 — `exp1_ce_interference`
 
 GEMM 在 `--gemm-dev` 上跑，同时 CE 在各 rank 之间搬运与 GEMM **无关**的数
