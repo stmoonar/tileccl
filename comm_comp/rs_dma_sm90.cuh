@@ -97,6 +97,11 @@ struct Sm90ReduceScatterDma {
     int world_size = 0;
     void *local_reduce_buffer = nullptr;  // [M/world, N] on this rank
     int **barrier_ptrs;                   // [world] IPC-mapped flag arrays
+    // false = RS-disabled control: the exact same kernel (static scheduler,
+    // XOR swizzle, smem carveout, warp layout) with fetch/reduce/flag-publish
+    // skipped. Isolates the kernel's *structural* cost from the price of the
+    // communication itself.
+    bool comm_enabled = true;
   };
 
   struct Params {
@@ -109,6 +114,7 @@ struct Sm90ReduceScatterDma {
     int rank;
     int world_size;
     int tile_m_perrank;  // M tiles per rank segment
+    bool comm_enabled;
 
     StrideMNL stride;
 
@@ -136,6 +142,7 @@ struct Sm90ReduceScatterDma {
 
     params.rank = args.rank;
     params.world_size = args.world_size;
+    params.comm_enabled = args.comm_enabled;
     RS_CHECK(params.world_size <= kMaxWorld);
     RS_CHECK((params.world_size & (params.world_size - 1)) == 0);  // XOR swizzle
 

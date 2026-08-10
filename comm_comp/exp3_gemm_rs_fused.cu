@@ -18,14 +18,18 @@
 //
 //   baseline: the same-config stock CUTLASS cooperative GEMM (comm_none),
 //             also run symmetrically on all ranks
+//   ctrl:     the IDENTICAL RS kernel with communication disabled at runtime
+//             (fetch/reduce warps idle, no flag publishes). Same static
+//             scheduler, same XOR swizzle, same smem carveout / mainloop
+//             stage count as fused, so ctrl/baseline prices the kernel's
+//             STRUCTURAL changes and fused/ctrl prices the COMMUNICATION
+//             alone -- without this split the two are confounded
 //   fused:    the GEMM+RS kernel; its time covers compute + all pulls +
-//             reduction, and (fused - baseline) is the total price of the
-//             in-kernel communication: 2 warps of SM residency, epilogue
-//             flag publishes, NVLink pull bandwidth, and the tail where
-//             DMA warps wait for the slowest peer's tiles
+//             reduction
 //
-//   slowdown = t_fused / t_baseline    per rank; also reported: effective
-//   pull bandwidth (world-1)/world * M*N*2 / t_fused, and achieved TFLOP/s.
+//   Per rank: struct = t_ctrl/t_base, comm = t_fused/t_ctrl, and
+//   total = t_fused/t_base = struct * comm. Also reported: effective pull
+//   bandwidth (world-1)/world * M*N*2 / t_fused, and achieved TFLOP/s.
 //
 // --verify checks reduce_buffer == sum over ranks of their D[segment rank]
 // (reference summed in fp32 from the ranks' actual D outputs; tolerance
@@ -355,14 +359,27 @@ int main(int argc, char** argv) {
   RsRunner fused;
   fused.init(rs_args);
 
+  // RS-off control: same kernel, same params, communication switched off
+  typename RsKernel::Arguments ctrl_args = rs_args;
+  ctrl_args.rs_dma.comm_enabled = false;
+  RsRunner ctrl;
+  ctrl.init(ctrl_args);
+
   if (rank == 0) {
     std::printf("=== exp3 v2: fused GEMM+RS (flux sm90 design) vs stock GEMM ===\n");
     std::printf("world %d (1 process per GPU, cudaIPC), %dx%dx%d fp16 per rank\n",
                 world, cfg.m, cfg.n, cfg.k);
     std::printf("tile 128x256x64 cluster 1x2x1, mainloop stages: baseline %d, "
-                "fused %d (DMA smem carveout)\n",
+                "ctrl/fused %d (DMA smem carveout)\n",
                 (int)BaselineCfg::CollectiveMainloop::DispatchPolicy::Stages,
                 (int)CollectiveMainloopRs::DispatchPolicy::Stages);
+    // flux forces epilogue StagesD=1 to buy back smem for the mainloop; we
+    // keep the builder default on baseline+ctrl+fused alike, so the ctrl
+    // column absorbs whatever that choice costs.
+    std::printf("epilogue StagesC %d StagesD %d (builder default; flux "
+                "gemm_v3_reduce_scatter forces StagesD=1)\n",
+                (int)CollectiveEpilogueRs::DispatchPolicy::StagesC,
+                (int)CollectiveEpilogueRs::DispatchPolicy::StagesD);
     std::printf("RS pull volume per rank: %.1f MiB, grid %d blocks\n\n",
                 (double)(world - 1) / world * M * N * 2 / (1 << 20),
                 fused.grid.x * fused.grid.y * fused.grid.z);
@@ -373,6 +390,9 @@ int main(int argc, char** argv) {
   // ---- timing --------------------------------------------------------------
   const Stats base_st = time_iters(cfg, mp, sync, stream,
                                    [&] { baseline.run(stream); });
+  mp.barrier();
+  const Stats ctrl_st = time_iters(cfg, mp, sync, stream,
+                                   [&] { ctrl.run(stream); });
   mp.barrier();
   const Stats fuse_st = time_iters(cfg, mp, sync, stream,
                                    [&] { fused.run(stream); });
@@ -407,25 +427,32 @@ int main(int argc, char** argv) {
   mp.shm->results[rank][2] = fuse_st.mean;
   mp.shm->results[rank][3] = fuse_st.p95;
   mp.shm->results[rank][4] = max_diff;
+  mp.shm->results[rank][5] = ctrl_st.mean;
+  mp.shm->results[rank][6] = ctrl_st.p95;
   mp.barrier();
 
   if (rank == 0) {
-    std::printf("%4s | %12s %8s | %12s %8s | %8s %8s %9s | %s\n", "rank",
-                "base us", "TFLOP/s", "fused us", "TFLOP/s", "slowdn",
-                "ovhd us", "pull GB/s", "verify");
+    std::printf("%4s | %12s %8s | %10s | %12s %8s | %6s %6s %6s | %9s | %s\n",
+                "rank", "base us", "TFLOP/s", "ctrl us", "fused us", "TFLOP/s",
+                "struct", "comm", "total", "pull GB/s", "verify");
     FILE* csv = nullptr;
     if (!cfg.csv.empty()) {
       csv = std::fopen(cfg.csv.c_str(), "a");
       if (csv)
         std::fprintf(csv,
-                     "m,n,k,world,rank,base_us,base_p95,fused_us,fused_p95,"
-                     "slowdown,pull_gbps,max_rel_diff\n");
+                     "m,n,k,world,rank,base_us,base_p95,ctrl_us,ctrl_p95,"
+                     "fused_us,fused_p95,struct_sd,comm_sd,total_sd,"
+                     "pull_gbps,max_rel_diff\n");
     }
-    double worst = 0;
+    double worst_total = 0, worst_comm = 0;
     for (int r = 0; r < world; ++r) {
       const double b = mp.shm->results[r][0], f = mp.shm->results[r][2];
-      const double slow = b > 0 ? f / b : 0;
-      worst = std::max(worst, slow);
+      const double c = mp.shm->results[r][5];
+      const double sd_struct = b > 0 ? c / b : 0;  // kernel structure alone
+      const double sd_comm = c > 0 ? f / c : 0;    // communication alone
+      const double sd_total = b > 0 ? f / b : 0;
+      worst_total = std::max(worst_total, sd_total);
+      worst_comm = std::max(worst_comm, sd_comm);
       const double pull_gbps =
           (double)(world - 1) / world * M * N * 2 / (f * 1e-6) / 1e9;
       const double vd = mp.shm->results[r][4];
@@ -436,22 +463,29 @@ int main(int argc, char** argv) {
       if (!cfg.verify) std::snprintf(ver, sizeof(ver), "-");
       else std::snprintf(ver, sizeof(ver), "%s (rel %.3g)",
                          vd <= 0.05 ? "ok" : "FAIL", vd);
-      std::printf("%4d | %12.1f %8.1f | %12.1f %8.1f | %8.3f %8.1f %9.1f | %s\n",
-                  r, b, flop / (b * 1e-6) / 1e12, f, flop / (f * 1e-6) / 1e12,
-                  slow, f - b, pull_gbps, ver);
+      std::printf("%4d | %12.1f %8.1f | %10.1f | %12.1f %8.1f | %6.3f %6.3f "
+                  "%6.3f | %9.1f | %s\n",
+                  r, b, flop / (b * 1e-6) / 1e12, c, f,
+                  flop / (f * 1e-6) / 1e12, sd_struct, sd_comm, sd_total,
+                  pull_gbps, ver);
       if (csv)
-        std::fprintf(csv, "%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%.4g\n",
+        std::fprintf(csv,
+                     "%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,"
+                     "%.4f,%.2f,%.4g\n",
                      cfg.m, cfg.n, cfg.k, world, r, b, mp.shm->results[r][1],
-                     f, mp.shm->results[r][3], slow, pull_gbps, vd);
+                     c, mp.shm->results[r][6], f, mp.shm->results[r][3],
+                     sd_struct, sd_comm, sd_total, pull_gbps, vd);
     }
     if (csv) std::fclose(csv);
     std::printf(
-        "\nfused time covers compute + NVLink pulls + fp16 reduction; the\n"
-        "baseline is the identical stock GEMM run symmetrically on all "
-        "ranks.\nworst-rank slowdown: %.3f. flux pays this to keep the "
-        "epilogue local\ninstead of remote-writing (comm_comp v1 exp3 "
-        "measures that other option).\n",
-        worst);
+        "\nstruct = ctrl/base: cost of the kernel restructuring alone (static\n"
+        "scheduler, swizzle, smem carveout; comm switched off).\n"
+        "comm = fused/ctrl: cost of the communication alone (flag publishes,\n"
+        "NVLink pulls, fp16 reduction, slowest-peer tail).\n"
+        "worst-rank: total %.3f, comm %.3f. flux pays this to keep the\n"
+        "epilogue local instead of remote-writing (v1 exp3 measures that "
+        "option).\n",
+        worst_total, worst_comm);
   }
   mp.barrier();
 

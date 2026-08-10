@@ -48,6 +48,10 @@ CTA，各有自己的 payload slot 和自己的 flag，target 等全部 F = ΣM 
   - 这四个 mode **互相之间的差值是干净的**（加数相同）；
   - 与 `pull`（无握手）比**绝对值**时，从前四者中减去 `sync_cost` ping-pong
     的单向延迟。
+- `pull` 的 `t0` 读取后有**第二次 grid barrier**，保证时间戳先于任何 CTA
+  的第一条远端 load（否则其它 CTA 会抢跑在 t0 之前，pull 被系统性少计
+  ——偏差是 barrier 释放偏斜量级，对小消息点占比可观）。计时窗因此含一次
+  barrier release，与 push 侧计时窗内的 `__syncthreads` release 对称。
 - 逐轮样本报 min / p50 / p95 / p99。fan-in 成本是尾部现象（等最慢的那个
   peer），均值会骗人。
 

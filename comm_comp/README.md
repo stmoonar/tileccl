@@ -31,7 +31,15 @@ nvidia-smi -lgc 1980 -i 0,1,2,3      # H800 图形时钟按机器实际上限调
 sudo nvidia-smi -lgc 1980 -i 0,1,2,3   # 先锁频（脚本只记录时钟，不改）
 ./run_all.sh                            # 全量，约 20-40 分钟
 QUICK=1 ./run_all.sh                    # 快速版
+FORCE=1 ./run_all.sh                    # 跳过环境前置检查（结果按脏数据对待）
 ```
+
+**环境前置检查**：开跑前用 `nvidia-smi` 检查目标 GPU（尊重
+`CUDA_VISIBLE_DEVICES`）：利用率 >5%、显存被其它进程占 >2 GiB、或 SM 时
+钟 <1000 MHz（未锁频的空闲卡会掉到 ~345 MHz；锁频后即使空闲也保持锁定
+值）任一命中就拒跑。共享机上跑出来的数字比没有数字更糟——它们看起来是真
+的。注意程序里打印的 "1980 MHz" 来自 `cudaDevAttrClockRate`，是**峰值**
+而非实时频率；判断是否锁频以 `env.txt` 里 `clocks.sm` 的当前值为准。
 
 编译 + 依次跑完全部实验（含 `--verify`），日志/CSV/环境快照（nvidia-smi
 拓扑、时钟、nvcc 版本、git commit）收进 `results_<时间戳>/` 并打包成
@@ -65,7 +73,13 @@ TFLOP/s。
 ```
 
 宿主线程用事件环（ring of bursts）持续喂 CE，保证整个 GEMM 计时窗内 CE
-不空闲；若观察到空闲会在行尾标 `[!]`，此时 S_c 只是下界。
+不空闲；若观察到空闲会在行尾标 `[!]`，此时 S_c 只是下界。`ovl GB/s` 只统
+计 GEMM 结束前已轮询到完成的 chunk（drain 阶段不计入），是重叠带宽的下界。
+
+每个 shape 的所有模式跑完后会**复测一次 alone 基线**并打印漂移百分比
+（`baseline recheck`）：所有 S_c 都是对开头基线的比值，若期间环境变化
+（别的任务上机、时钟下滑），漂移 >5% 会标 `[!]`，该 shape 的全部 S_c 应
+视为不可信。
 
 ## 实验二：搬运粒度 vs 计算效率 — `exp2_ag_gemm_granularity`
 
@@ -144,9 +158,24 @@ warp——Fetch 自旋等 peer 的 tile flag 然后 TMA 从 peer 拉到 smem，R
 从 smem 读出后用 `red.global.add.noftz.v8.f16` 归约进本地 reduce buffer。
 通信完全在 GEMM kernel 内部，代价直接体现为 kernel 时间膨胀：
 
+三组对照（一次运行全部测完，同环境）：
+
 ```
-slowdown = t_fused / t_baseline    （baseline = 同配置 stock GEMM）
+baseline : 同配置 stock CUTLASS GEMM
+ctrl     : 同一个 RS kernel，运行时关闭通信（fetch/reduce warp 空转、
+           不发布 flag）——静态调度器 / XOR swizzle / smem carveout /
+           mainloop stage 数与 fused 完全一致
+fused    : 完整 GEMM+RS
+
+struct = t_ctrl / t_base     kernel 结构改造本身的代价
+comm   = t_fused / t_ctrl    通信本身的代价（flag 同步 + NVLink 拉取 +
+                             fp16 归约 + 等最慢 peer 的尾部）
+total  = t_fused / t_base  = struct × comm
 ```
+
+没有 ctrl 组时 struct 与 comm 混在一起无法归因（stock baseline 和 fused
+的调度器/stage 数本来就不同）；有了它，"融合的净代价"才能干净地归到通信
+头上。
 
 移植说明（对照 flux 源码）：
 
@@ -160,10 +189,11 @@ slowdown = t_fused / t_baseline    （baseline = 同配置 stock GEMM）
 - tile 顺序用 flux `WorkIdxMSwizzler` 的 XOR swizzle（nnodes=1 折叠）：
   rank r 在第 t 步生产 segment `s⊕r`，恰好是 rank `s⊕r` 第 t 步要拉取的
   tile——生产与消费天然锁步。要求 world 为 2 的幂。
-- flux 强制 epilogue `StagesD=1`，这里保留 stock 的 stage 数（逐 tile
-  `tma_store_wait<0>` 已经起到同样的排空作用）；DMA smem 计入 mainloop
-  stage carveout，所以 fused kernel 的 mainloop stage 数可能比 baseline
-  少一档（程序会打印两者）。
+- flux 强制 epilogue `StagesD=1`（省 smem 换 mainloop stage），这里
+  baseline/ctrl/fused 统一保留 builder 默认值（程序会打印 StagesC/StagesD
+  与两侧 mainloop stage 数）：ctrl 与 fused 完全同构，这个偏离 flux 的选
+  择被 ctrl 列吸收，不再污染 comm 的归因；逐 tile `tma_store_wait<0>` 已
+  起到 flux StagesD=1 的排空作用。
 
 **多进程**：一进程一卡（`fork`），buffer 用 cudaIPC 交换（匿名共享 mmap
 传 handle），flux 式 device barrier-all 对齐各 rank 的每次迭代——与
@@ -176,10 +206,11 @@ make exp3_gemm_rs_fused
 ./exp3_gemm_rs_fused --m 8192 --n 8192 --k 2048 --csv rs.csv
 ```
 
-读法：`slowdn` 是融合通信的全部代价（2 个 warp 的 SM 驻留 + flag 同步 +
-NVLink 拉取 + 等最慢 peer 的尾部）。与 `exp3_epilogue_remote` 的
-remote/local 比值对照，可以回答"flux 在 sm90 上选 pull 而不是 epilogue
-远端写，赚了还是亏了"。
+读法：看 `comm` 列（fused/ctrl）——这是融合通信的净代价；`struct` 列
+（ctrl/base）是 kernel 结构税，与通信无关。分布式指标看 **worst-rank**
+（程序末尾打印），单 rank 均值会低估同步尾部。与 `exp3_epilogue_remote`
+的 remote/local 比值对照，可以回答"flux 在 sm90 上选 pull 而不是
+epilogue 远端写，赚了还是亏了"。
 
 ## 实现备注（对照 flux / CUDA 12.9）
 

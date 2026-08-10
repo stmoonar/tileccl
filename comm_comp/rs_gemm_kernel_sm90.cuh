@@ -602,22 +602,27 @@ public:
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
       // RS Fetch Warp (the CLC scheduler warp is idle under the static
-      // persistent scheduler; flux runs its ReduceScatterFetch role here)
+      // persistent scheduler; flux runs its ReduceScatterFetch role here).
+      // With comm disabled (RS-off control) the warp falls through and idles,
+      // exactly like the stock kernel's scheduler warp under a static
+      // scheduler -- same residency, no communication.
       if (producer_warp_role == ProducerWarpRole::Warp1) {
-        ReduceScatterDma rs_dma(params.rs_dma, shared_storage.tensors.rs_dma);
-        while (work_tile_info.is_valid()) {
-          auto m_coord = idx2crd(work_tile_info.M_idx, shape<2>(gA_mkl));
-          auto n_coord = idx2crd(work_tile_info.N_idx, shape<2>(gB_nkl));
-          auto l_coord = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl));
-          auto blk_coord = make_coord(m_coord, n_coord, _, l_coord);
+        if (params.rs_dma.comm_enabled) {
+          ReduceScatterDma rs_dma(params.rs_dma, shared_storage.tensors.rs_dma);
+          while (work_tile_info.is_valid()) {
+            auto m_coord = idx2crd(work_tile_info.M_idx, shape<2>(gA_mkl));
+            auto n_coord = idx2crd(work_tile_info.N_idx, shape<2>(gB_nkl));
+            auto l_coord = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl));
+            auto blk_coord = make_coord(m_coord, n_coord, _, l_coord);
 
-          rs_fetch_pipe_producer_state = rs_dma.fetch(
-            rs_fetch_pipeline, rs_fetch_pipe_producer_state, problem_shape_MNKL, blk_coord);
+            rs_fetch_pipe_producer_state = rs_dma.fetch(
+              rs_fetch_pipeline, rs_fetch_pipe_producer_state, problem_shape_MNKL, blk_coord);
 
-          auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
-          work_tile_info = rs_swizzle(params.rs_dma, next_work_tile_info);
+            auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
+            work_tile_info = rs_swizzle(params.rs_dma, next_work_tile_info);
+          }
+          rs_dma.fetch_tail(rs_fetch_pipeline, rs_fetch_pipe_producer_state);
         }
-        rs_dma.fetch_tail(rs_fetch_pipeline, rs_fetch_pipe_producer_state);
       } // RS Fetch Warp End
       else
 
@@ -682,20 +687,23 @@ public:
 
       }
       // RS Reduce Warp (the MainloopAux warp is idle for this mainloop;
-      // flux runs its ReduceScatterReduce role here)
+      // flux runs its ReduceScatterReduce role here). Idles when comm is
+      // disabled, like the stock kernel's MainloopAux warp.
       else if (producer_warp_role == ProducerWarpRole::MainloopAux) {
-        ReduceScatterDma rs_dma(params.rs_dma, shared_storage.tensors.rs_dma);
-        while (work_tile_info.is_valid()) {
-          auto m_coord = idx2crd(work_tile_info.M_idx, shape<2>(gA_mkl));
-          auto n_coord = idx2crd(work_tile_info.N_idx, shape<2>(gB_nkl));
-          auto l_coord = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl));
-          auto blk_coord = make_coord(m_coord, n_coord, _, l_coord);
+        if (params.rs_dma.comm_enabled) {
+          ReduceScatterDma rs_dma(params.rs_dma, shared_storage.tensors.rs_dma);
+          while (work_tile_info.is_valid()) {
+            auto m_coord = idx2crd(work_tile_info.M_idx, shape<2>(gA_mkl));
+            auto n_coord = idx2crd(work_tile_info.N_idx, shape<2>(gB_nkl));
+            auto l_coord = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl));
+            auto blk_coord = make_coord(m_coord, n_coord, _, l_coord);
 
-          rs_fetch_pipe_consumer_state = rs_dma.reduce(
-            rs_fetch_pipeline, rs_fetch_pipe_consumer_state, problem_shape_MNKL, blk_coord);
+            rs_fetch_pipe_consumer_state = rs_dma.reduce(
+              rs_fetch_pipeline, rs_fetch_pipe_consumer_state, problem_shape_MNKL, blk_coord);
 
-          auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
-          work_tile_info = rs_swizzle(params.rs_dma, next_work_tile_info);
+            auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
+            work_tile_info = rs_swizzle(params.rs_dma, next_work_tile_info);
+          }
         }
       } // RS Reduce Warp End
 
@@ -847,7 +855,9 @@ public:
           // them as valid work; the epilogue predicates its stores, and a
           // flag for a tile no fetch warp will ever consume would deadlock
           // the next iteration). Same guard as flux's AuxStore end().
-          if (work_tile_info.M_idx < size<0>(params.rs_dma.tile_layout.shape()) &&
+          // Skipped entirely in the RS-off control (no one consumes flags).
+          if (params.rs_dma.comm_enabled &&
+              work_tile_info.M_idx < size<0>(params.rs_dma.tile_layout.shape()) &&
               work_tile_info.N_idx < size<1>(params.rs_dma.tile_layout.shape())) {
             cute::tma_store_wait<0>();
             using FlagSync = cutlass::detail::NamedBarrierSync<

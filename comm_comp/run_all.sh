@@ -5,11 +5,15 @@
 #
 #   cd comm_comp && ./run_all.sh
 #   QUICK=1 ./run_all.sh          # shorter windows / fewer iterations
+#   FORCE=1 ./run_all.sh          # skip the environment pre-check abort
 #
 # Notes:
 #   * lock clocks first or the numbers are noisy:
 #       sudo nvidia-smi -lgc <freq> -i 0,1,2,3
 #     (the script only RECORDS clocks, it never changes them)
+#   * the pre-check below refuses to run if any target GPU is busy, has
+#     foreign allocations, or looks unlocked -- a benchmark on a shared box
+#     produces numbers that are worse than none (they look real).
 #   * every run has a timeout; a hang (e.g. a broken flag pairing in the
 #     fused GEMM+RS) is recorded in manifest.txt as rc=124 instead of
 #     stalling the script, and leftover ranks are pkill'ed.
@@ -46,6 +50,41 @@ log "== comm_comp run_all $STAMP (QUICK=$QUICK) =="
   echo "--- cpu ---"
   lscpu 2>/dev/null | head -20
 } > "$OUT/env.txt" 2>&1
+
+# ---------------------------------------------------------------------------
+# environment pre-check: refuse to bench on a busy or unlocked box.
+# util/memory catch a co-tenant job (its processes may be invisible from
+# inside a container, but its load is not); a low idle SM clock means nobody
+# ran nvidia-smi -lgc (locked clocks hold their frequency even at idle).
+# ---------------------------------------------------------------------------
+ids=""
+[ -n "${CUDA_VISIBLE_DEVICES:-}" ] && ids="-i $CUDA_VISIBLE_DEVICES"
+bad=0
+while IFS=',' read -r idx util mem sm smmax; do
+  idx=${idx// /}; util=${util// /}; mem=${mem// /}
+  sm=${sm// /}; smmax=${smmax// /}
+  case "$util$mem$sm" in *[!0-9]*) continue ;; esac   # skip [N/A] rows
+  if [ "$util" -gt 5 ]; then
+    log "!! GPU $idx: utilization ${util}% -- another job is running"; bad=1
+  fi
+  if [ "$mem" -gt 2048 ]; then
+    log "!! GPU $idx: ${mem} MiB already allocated by other processes"; bad=1
+  fi
+  if [ "$sm" -lt 1000 ]; then
+    log "!! GPU $idx: SM clock ${sm} MHz (max ${smmax}) -- looks UNLOCKED;" \
+        "run: sudo nvidia-smi -lgc <freq>"; bad=1
+  fi
+done < <(nvidia-smi $ids \
+    --query-gpu=index,utilization.gpu,memory.used,clocks.sm,clocks.max.sm \
+    --format=csv,noheader,nounits 2>/dev/null)
+if [ "$bad" = 1 ]; then
+  if [ "${FORCE:-0}" = 1 ]; then
+    log "!! pre-check FAILED but FORCE=1 -- continuing; treat results as dirty"
+  else
+    log "!! environment pre-check FAILED -- fix the above or rerun with FORCE=1"
+    exit 1
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # build

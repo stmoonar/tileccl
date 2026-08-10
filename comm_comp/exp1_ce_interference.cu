@@ -42,6 +42,7 @@
 #include "gemm_sm90.cuh"
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -574,6 +575,22 @@ int main(int argc, char** argv) {
         destroy_legs(legs);
       }
     }
+
+    // Paired baseline: re-measure `alone` after all patterns ran. Every S_c
+    // above is a ratio against the *opening* baseline, so environmental drift
+    // (another job landing on the box, clocks sagging) silently pollutes all
+    // of them; this makes it visible and flags the whole block.
+    g.enqueue_timed(3, iters);
+    CUDA_CHECK(cudaEventSynchronize(g.e_end));
+    const Stats alone2 = g.collect(iters);
+    const double drift =
+        alone.mean > 0 ? alone2.mean / alone.mean - 1.0 : 0.0;
+    std::printf("baseline recheck: alone %.1f -> %.1f us/iter (drift %+.1f%%)%s\n",
+                alone.mean, alone2.mean, drift * 100.0,
+                std::fabs(drift) > 0.05
+                    ? "  [!] drift >5%: environment not quiet, every S_c "
+                      "above is unreliable"
+                    : "");
     std::printf("\n");
     g.destroy();
   }

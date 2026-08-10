@@ -232,6 +232,13 @@ __global__ void pull_kernel(int fanin, uint32_t nvec, uint64_t stride_vec,
   for (uint32_t r = 1; r <= rounds; ++r) {
     grid_barrier(bar_count, bar_gen, gridDim.x);
     if (bid == 0 && threadIdx.x == 0) t0 = clock64();
+    // Second barrier so t0 happens-before any CTA's first remote load.
+    // Without it CTAs != 0 race ahead of the timestamp and pull is
+    // systematically under-timed (by the barrier-exit skew, which is a
+    // visible fraction of the small-size points). The timed window now
+    // includes one barrier release, mirroring the __syncthreads release
+    // inside the push-side timed window.
+    grid_barrier(bar_count, bar_gen, gridDim.x);
 
     for (uint32_t v = threadIdx.x; v < nvec; v += blockDim.x)
       dst[v] = __ldcv(&src[v]);
