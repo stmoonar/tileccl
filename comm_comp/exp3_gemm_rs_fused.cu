@@ -46,6 +46,7 @@
 
 #include "cutlass/device_kernel.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -94,19 +95,54 @@ struct Config {
   int ndev = 0;
   bool verify = false;
   std::string csv;
+  std::string dump;                       // per-iteration dump prefix
+  std::string order = "base,ctrl,fused";  // timing order (run-order control)
 };
 
 static void usage(const char* prog) {
   std::printf(
       "usage: %s [options]\n"
-      "  --m/--n/--k N   GEMM shape per rank (default 8192^3)\n"
-      "                  M %% (tile_M*world) == 0, N %% tile_N == 0 required\n"
-      "  --iters N       timed iterations (default 50)\n"
-      "  --warmup N      warmup iterations (default 5)\n"
-      "  --ndev N        use only the first N GPUs (default: all)\n"
-      "  --verify        check the reduce-scatter result numerically\n"
-      "  --csv PATH      append machine-readable rows (rank 0 writes)\n",
+      "  --m/--n/--k N     GEMM shape per rank (default 8192^3)\n"
+      "                    M %% (tile_M*world) == 0, N %% tile_N == 0 required\n"
+      "  --iters N         timed iterations (default 50)\n"
+      "  --warmup N        warmup iterations (default 5)\n"
+      "  --ndev N          use only the first N GPUs (default: all)\n"
+      "  --verify          check the reduce-scatter result numerically\n"
+      "  --csv PATH        append machine-readable rows (rank 0 writes)\n"
+      "  --dump-iters PRE  raw per-iteration times -> PRE.rank<N>.csv, every\n"
+      "                    rank. mean+p95 cannot tell a distribution shift\n"
+      "                    from three slow iterations; the series can\n"
+      "  --order LIST      permutation of base,ctrl,fused fixing the order the\n"
+      "                    three variants are timed in (default\n"
+      "                    base,ctrl,fused). Whatever runs first absorbs any\n"
+      "                    residual ramp-up, which biases struct_sd=ctrl/base;\n"
+      "                    run the reverse to price that bias\n",
       prog);
+}
+
+// Split --order into the three variant names, rejecting anything that is not
+// a permutation (a typo that silently dropped a variant would leave its Stats
+// zeroed and every ratio nonsense).
+static std::vector<std::string> parse_order(const std::string& spec) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos <= spec.size()) {
+    const size_t comma = spec.find(',', pos);
+    const size_t end = comma == std::string::npos ? spec.size() : comma;
+    out.push_back(spec.substr(pos, end - pos));
+    if (comma == std::string::npos) break;
+    pos = end + 1;
+  }
+  std::vector<std::string> want = {"base", "ctrl", "fused"};
+  std::vector<std::string> got = out;
+  std::sort(got.begin(), got.end());
+  if (got != want) {
+    std::fprintf(stderr,
+                 "--order '%s' is not a permutation of base,ctrl,fused\n",
+                 spec.c_str());
+    std::exit(1);
+  }
+  return out;
 }
 
 static Config parse_args(int argc, char** argv) {
@@ -128,6 +164,8 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--ndev") c.ndev = std::atoi(next().c_str());
     else if (a == "--verify") c.verify = true;
     else if (a == "--csv") c.csv = next();
+    else if (a == "--dump-iters") c.dump = next();
+    else if (a == "--order") c.order = next();
     else if (a == "-h" || a == "--help") { usage(argv[0]); std::exit(0); }
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
@@ -223,10 +261,13 @@ static __global__ void verify_kernel(HalfPtrs douts, const __half* reduce_buf,
 // timing helper
 // ---------------------------------------------------------------------------
 
+// per_out (optional) receives the raw per-iteration series in launch order --
+// make_stats sorts its copy, so the time axis is lost after this point.
 template <class LaunchFn>
 static Stats time_iters(const Config& cfg, mproc::MultiProc& mp,
                         const mproc::SyncPtrs& sync, cudaStream_t stream,
-                        LaunchFn&& launch) {
+                        LaunchFn&& launch,
+                        std::vector<double>* per_out = nullptr) {
   std::vector<cudaEvent_t> eb(cfg.iters), ee(cfg.iters);
   for (int i = 0; i < cfg.iters; ++i) {
     CUDA_CHECK(cudaEventCreate(&eb[i]));
@@ -251,6 +292,7 @@ static Stats time_iters(const Config& cfg, mproc::MultiProc& mp,
     cudaEventDestroy(eb[i]);
     cudaEventDestroy(ee[i]);
   }
+  if (per_out) *per_out = per;
   return make_stats(per);
 }
 
@@ -388,17 +430,64 @@ int main(int argc, char** argv) {
   mp.barrier();
 
   // ---- timing --------------------------------------------------------------
-  const Stats base_st = time_iters(cfg, mp, sync, stream,
-                                   [&] { baseline.run(stream); });
-  mp.barrier();
-  const Stats ctrl_st = time_iters(cfg, mp, sync, stream,
-                                   [&] { ctrl.run(stream); });
-  mp.barrier();
-  const Stats fuse_st = time_iters(cfg, mp, sync, stream,
-                                   [&] { fused.run(stream); });
-  mp.barrier();
+  // Order is configurable (--order). It matters: whichever variant runs first
+  // absorbs any residual clock ramp or first-touch cost, and with the default
+  // base,ctrl,fused that lands entirely on `base` -- which inflates base and
+  // so pushes struct_sd=ctrl/base BELOW 1. Running the reverse order prices
+  // that bias instead of assuming it away.
+  const std::vector<std::string> order = parse_order(cfg.order);
+  Stats base_st, ctrl_st, fuse_st;
+  std::vector<double> base_per, ctrl_per, fuse_per;
+  for (const std::string& which : order) {
+    if (which == "base")
+      base_st = time_iters(cfg, mp, sync, stream,
+                           [&] { baseline.run(stream); }, &base_per);
+    else if (which == "ctrl")
+      ctrl_st = time_iters(cfg, mp, sync, stream,
+                           [&] { ctrl.run(stream); }, &ctrl_per);
+    else
+      fuse_st = time_iters(cfg, mp, sync, stream,
+                           [&] { fused.run(stream); }, &fuse_per);
+    mp.barrier();
+  }
+
+  // ---- per-iteration dump --------------------------------------------------
+  // mean and p95 together cannot separate "the whole distribution moved" from
+  // "3 of 50 iterations were slow" -- and the CSV's *_us columns are means, so
+  // a fat tail leaks straight into every reported ratio. Every rank writes its
+  // own file: the fused kernel waits on the slowest peer, so a tail on one
+  // rank is only interpretable next to the other three.
+  if (!cfg.dump.empty()) {
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s.rank%d.csv", cfg.dump.c_str(), rank);
+    FILE* df = std::fopen(path, "w");
+    if (!df) {
+      std::fprintf(stderr, "rank %d: cannot write %s\n", rank, path);
+    } else {
+      std::fprintf(df, "m,n,k,world,rank,variant,iter,us\n");
+      auto emit = [&](const char* name, const std::vector<double>& v) {
+        for (size_t i = 0; i < v.size(); ++i)
+          std::fprintf(df, "%d,%d,%d,%d,%d,%s,%zu,%.3f\n", cfg.m, cfg.n, cfg.k,
+                       world, rank, name, i, v[i]);
+      };
+      emit("base", base_per);
+      emit("ctrl", ctrl_per);
+      emit("fused", fuse_per);
+      std::fclose(df);
+    }
+  }
 
   // ---- verify --------------------------------------------------------------
+  // verify reads D_out (the last GEMM output) and reduce_buf (the RS result),
+  // which the default order leaves in place because fused runs last. Under a
+  // custom --order a later base/ctrl pass has since overwritten D_out, so
+  // refresh both with one untimed fused iteration first.
+  if (cfg.verify && order.back() != "fused") {
+    mproc::barrier_all_on_stream(sync, mp.rank, mp.world, stream);
+    fused.run(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    mp.barrier();
+  }
   double max_diff = -1;
   if (cfg.verify) {
     // D_out on every rank currently holds that rank's full GEMM output from
@@ -429,6 +518,15 @@ int main(int argc, char** argv) {
   mp.shm->results[rank][4] = max_diff;
   mp.shm->results[rank][5] = ctrl_st.mean;
   mp.shm->results[rank][6] = ctrl_st.p95;
+  // p50 and min are computed by make_stats and were previously dropped. p50 is
+  // the tail-immune view of the same ratio: if comm_sd rises on means but not
+  // on p50s, the rise is outliers, not cost.
+  mp.shm->results[rank][7] = base_st.p50;
+  mp.shm->results[rank][8] = ctrl_st.p50;
+  mp.shm->results[rank][9] = fuse_st.p50;
+  mp.shm->results[rank][10] = base_st.mn;
+  mp.shm->results[rank][11] = ctrl_st.mn;
+  mp.shm->results[rank][12] = fuse_st.mn;
   mp.barrier();
 
   if (rank == 0) {
@@ -442,8 +540,17 @@ int main(int argc, char** argv) {
         std::fprintf(csv,
                      "m,n,k,world,rank,base_us,base_p95,ctrl_us,ctrl_p95,"
                      "fused_us,fused_p95,struct_sd,comm_sd,total_sd,"
-                     "pull_gbps,max_rel_diff\n");
+                     "pull_gbps,max_rel_diff,"
+                     // appended (old columns keep their position/meaning)
+                     "base_p50,ctrl_p50,fused_p50,base_min,ctrl_min,fused_min,"
+                     "comm_sd_p50,comm_sd_skew,comm_abs_us,order,iters\n");
     }
+    // The fused kernel cannot finish before the SLOWEST peer has produced its
+    // tiles, so fused/ctrl_self charges a rank for its peers' spread. Dividing
+    // by max_r(ctrl_r) instead gives the skew-normalised tax.
+    double ctrl_max = 0;
+    for (int r = 0; r < world; ++r)
+      ctrl_max = std::max(ctrl_max, mp.shm->results[r][5]);
     double worst_total = 0, worst_comm = 0;
     for (int r = 0; r < world; ++r) {
       const double b = mp.shm->results[r][0], f = mp.shm->results[r][2];
@@ -468,17 +575,57 @@ int main(int argc, char** argv) {
                   r, b, flop / (b * 1e-6) / 1e12, c, f,
                   flop / (f * 1e-6) / 1e12, sd_struct, sd_comm, sd_total,
                   pull_gbps, ver);
-      if (csv)
+      if (csv) {
+        const double bp50 = mp.shm->results[r][7];
+        const double cp50 = mp.shm->results[r][8];
+        const double fp50 = mp.shm->results[r][9];
         std::fprintf(csv,
                      "%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,"
-                     "%.4f,%.2f,%.4g\n",
+                     "%.4f,%.2f,%.4g,"
+                     "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%.2f,%s,%d\n",
                      cfg.m, cfg.n, cfg.k, world, r, b, mp.shm->results[r][1],
                      c, mp.shm->results[r][6], f, mp.shm->results[r][3],
-                     sd_struct, sd_comm, sd_total, pull_gbps, vd);
+                     sd_struct, sd_comm, sd_total, pull_gbps, vd,
+                     bp50, cp50, fp50, mp.shm->results[r][10],
+                     mp.shm->results[r][11], mp.shm->results[r][12],
+                     cp50 > 0 ? fp50 / cp50 : 0,
+                     ctrl_max > 0 ? f / ctrl_max : 0,
+                     // absolute comm cost in us: the only cross-shape
+                     // comparable metric, since comm_sd's denominator moves
+                     // with K
+                     f - c, cfg.order.c_str(), cfg.iters);
+      }
     }
     if (csv) std::fclose(csv);
+
+    // Second view of the same three numbers, immune to the two things that
+    // make the mean-based table hard to read at large M: outlier iterations
+    // and inter-rank spread.
+    std::printf("\n%4s | %10s %10s %10s | %8s %8s %8s | %9s\n", "rank",
+                "base p50", "ctrl p50", "fusd p50", "comm p50", "comm avg",
+                "comm skew", "comm abs us");
+    for (int r = 0; r < world; ++r) {
+      const double bp = mp.shm->results[r][7], cp = mp.shm->results[r][8];
+      const double fp = mp.shm->results[r][9];
+      const double c = mp.shm->results[r][5], f = mp.shm->results[r][2];
+      std::printf("%4d | %10.1f %10.1f %10.1f | %8.3f %8.3f %8.3f | %9.1f\n", r,
+                  bp, cp, fp, cp > 0 ? fp / cp : 0, c > 0 ? f / c : 0,
+                  ctrl_max > 0 ? f / ctrl_max : 0, f - c);
+    }
     std::printf(
-        "\nstruct = ctrl/base: cost of the kernel restructuring alone (static\n"
+        "comm p50  = fused_p50/ctrl_p50: tail-immune. If it stays flat while\n"
+        "            comm avg rises, the rise is outlier iterations, not cost.\n"
+        "comm skew = fused_mean/max_r(ctrl_mean): charges each rank only for\n"
+        "            comm, not for its peers' spread (fused waits on the\n"
+        "            slowest producer either way).\n"
+        "comm abs  = fused-ctrl in us. Compare THIS across shapes -- comm_sd's\n"
+        "            denominator moves with K, so ratios are not comparable\n"
+        "            once K changes.\n"
+        "timing order: %s (%d iters, %d warmup)\n\n",
+        cfg.order.c_str(), cfg.iters, cfg.warmup);
+
+    std::printf(
+        "struct = ctrl/base: cost of the kernel restructuring alone (static\n"
         "scheduler, swizzle, smem carveout; comm switched off).\n"
         "comm = fused/ctrl: cost of the communication alone (flag publishes,\n"
         "NVLink pulls, fp16 reduction, slowest-peer tail).\n"
