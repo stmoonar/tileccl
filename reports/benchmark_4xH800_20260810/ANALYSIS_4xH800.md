@@ -24,6 +24,8 @@
 **存疑项说明**：`run_all.sh` 只构建 comm_comp，signalling 的 `signal_fanin` 二进制疑似未随
 `06cb8b0` 重编译。若属实，pull ≤32K 的点被低估约 0.5–1 µs（barrier 释放偏斜），大消息点与全部
 push 系数据不受影响。跑分机上 `cd signalling && make -B` 后重跑即可确认。
+*（已证实并解除：20260811 轮重编译后复跑 pull 4K = 2.56 µs，本轮的 1.62 确系陈旧二进制欠计时；
+以 `../benchmark_4xH800_20260811/` 的 signalling 数据为准。）*
 
 ---
 
@@ -83,6 +85,8 @@ swizzle + smem carveout），`comm = fused/ctrl`（纯通信）。
 - **K=8192：通信净代价 1.12×**（含全部 96 MiB NVLink 拉取 + fp16 归约 + 等最慢 peer）。
   而 **struct = 0.957——结构改造不亏反赚 4%**（静态调度器 + swizzle 在此 shape 小胜 stock，
   与 exp2/v1 的分段增益同源）。之前没有 ctrl 组时，1.07 的表观总代价低估了通信、高估了结构。
+  *（20260811 M-sweep 修正：该增益是大 shape 限定条款——仅 m≥4096 成立，m=1024–2048 时
+  struct 反亏 4–8%；见 `../benchmark_4xH800_20260811/ANALYSIS_MSWEEP_4xH800.md`。）*
 - fused 有效拉取只有 53 GB/s（CE 能跑 176）：瓶颈在**单 fetch warp 的 TMA 拉取路径与 flag 同步**，
   不在链路。
 - **低算强下融合完全不划算**：fused 有 ~1.15–1.39 ms 的通信地板，K=512 时是 baseline 的 8.8×。

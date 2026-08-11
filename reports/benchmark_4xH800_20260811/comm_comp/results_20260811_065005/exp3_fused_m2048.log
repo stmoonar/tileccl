@@ -1,0 +1,18 @@
+=== exp3 v2: fused GEMM+RS (flux sm90 design) vs stock GEMM ===
+world 4 (1 process per GPU, cudaIPC), 2048x8192x8192 fp16 per rank
+tile 128x256x64 cluster 1x2x1, mainloop stages: baseline 4, ctrl/fused 3 (DMA smem carveout)
+epilogue StagesC 4 StagesD 2 (builder default; flux gemm_v3_reduce_scatter forces StagesD=1)
+RS pull volume per rank: 24.0 MiB, grid 132 blocks
+
+rank |      base us  TFLOP/s |    ctrl us |     fused us  TFLOP/s | struct   comm  total | pull GB/s | verify
+   0 |        387.2    709.8 |      417.1 |        526.2    522.4 |  1.077  1.261  1.359 |      47.8 | ok (rel 0.0143)
+   1 |        417.4    658.5 |      446.6 |        537.5    511.4 |  1.070  1.204  1.288 |      46.8 | ok (rel 0.0143)
+   2 |        403.1    681.9 |      437.0 |        532.9    515.8 |  1.084  1.219  1.322 |      47.2 | ok (rel 0.0141)
+   3 |        388.4    707.8 |      419.8 |        522.8    525.8 |  1.081  1.245  1.346 |      48.1 | ok (rel 0.0154)
+
+struct = ctrl/base: cost of the kernel restructuring alone (static
+scheduler, swizzle, smem carveout; comm switched off).
+comm = fused/ctrl: cost of the communication alone (flag publishes,
+NVLink pulls, fp16 reduction, slowest-peer tail).
+worst-rank: total 1.359, comm 1.261. flux pays this to keep the
+epilogue local instead of remote-writing (v1 exp3 measures that option).
