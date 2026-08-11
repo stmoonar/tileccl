@@ -130,8 +130,10 @@ else
   # small M is a granularity/latency effect (few tiles, shallow waves, fixed
   # sync overheads), not a bandwidth one -- the axis the flux paper sweeps
   # (their decode points m=64/512), orthogonal to our K sweep.
-  MSWEEP_V1="64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192"
-  MSWEEP_V2="512 1024 2048 4096"
+  # (m=8192 comes from the default exp3 runs; above it the sweep checks the
+  # large-M plateau -- comm_sd should stay flat once waves are saturated)
+  MSWEEP_V1="64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192,16384x8192x8192,32768x8192x8192"
+  MSWEEP_V2="512 1024 2048 4096 16384 32768"
 fi
 
 # ---------------------------------------------------------------------------
