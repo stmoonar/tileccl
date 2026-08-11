@@ -1,0 +1,31 @@
+=== exp2: AG+GEMM overlap granularity sweep ===
+world 4, GEMM on GPU 0, pull mode, one comm stream per peer
+GPU 0: NVIDIA H20  sm_90  78 SMs  1980 MHz
+GPU 1: NVIDIA H20  sm_90  78 SMs  1980 MHz
+GPU 2: NVIDIA H20  sm_90  78 SMs  1980 MHz
+GPU 3: NVIDIA H20  sm_90  78 SMs  1980 MHz
+
+--- 8192x8192x8192 fp16 (shard M=2048, AG volume 96.0 MiB): full GEMM 7889.1 us, 139.4 TFLOP/s ---
+   S   rows  chunkMiB |  t_seg us  segeff |    t_comm    GB/s |  t_ovl us  TFLOPs  ovl_eff   bub% | ver
+   1   2048     32.00 |    8172.9   0.965 |     264.8   380.1 |    8203.5   134.0    0.884   0.4% | -
+   2   1024     16.00 |    9373.8   0.842 |     266.8   377.3 |    9393.7   117.0    0.925   0.2% | -
+   4    512      8.00 |    9406.2   0.839 |     264.9   380.0 |    9446.2   116.4    0.849   0.4% | -
+   8    256      4.00 |    9530.5   0.828 |     268.3   375.1 |    9563.7   115.0    0.876   0.3% | -
+  16    128      2.00 |   19000.8   0.415 |     319.4   315.2 |   19086.0    57.6    0.733   0.4% | -
+  32     64      1.00 |   37996.0   0.208 |     462.8   217.5 |   38131.0    28.8    0.708   0.4% | -
+
+--- 16384x8192x8192 fp16 (shard M=4096, AG volume 192.0 MiB): full GEMM 15485.8 us, 142.0 TFLOP/s ---
+   S   rows  chunkMiB |  t_seg us  segeff |    t_comm    GB/s |  t_ovl us  TFLOPs  ovl_eff   bub% | ver
+   1   4096     64.00 |   16313.8   0.949 |     517.1   389.4 |   16387.4   134.2    0.858   0.5% | -
+   2   2048     32.00 |   16346.9   0.947 |     517.8   388.8 |   16410.6   134.0    0.877   0.4% | -
+   4   1024     16.00 |   18731.7   0.827 |     519.2   387.8 |   18781.6   117.1    0.904   0.3% | -
+   8    512      8.00 |   18812.9   0.823 |     522.7   385.2 |   18895.3   116.4    0.842   0.4% | -
+  16    256      4.00 |   19029.3   0.814 |     530.2   379.8 |   19131.8   114.9    0.807   0.5% | -
+  32    128      2.00 |   38013.2   0.407 |     644.2   312.5 |   38176.6    57.6    0.746   0.4% | -
+
+seg_eff = t_full/t_seg (segmentation-only GEMM efficiency).
+ovl_eff = (t_seg + t_comm - t_ovl) / min(t_seg, t_comm); 1.0 means the
+shorter phase is fully hidden. bub% = t_ovl over max(t_seg, t_comm).
+The sweet spot is the S with the lowest t_ovl: finer chunks start compute
+earlier but pay tile quantization + per-chunk signalling; coarser chunks
+expose the first chunk's flight time.

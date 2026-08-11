@@ -1,0 +1,19 @@
+=== exp2: AG+GEMM overlap granularity sweep ===
+world 4, GEMM on GPU 0, pull mode, one comm stream per peer
+GPU 0: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 1: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 2: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 3: NVIDIA H800  sm_90  132 SMs  1980 MHz
+
+--- 8192x8192x8192 fp16 (shard M=2048, AG volume 96.0 MiB): full GEMM 1791.9 us, 613.6 TFLOP/s ---
+   S   rows  chunkMiB |  t_seg us  segeff |    t_comm    GB/s |  t_ovl us  TFLOPs  ovl_eff   bub% | ver
+   1   2048     32.00 |    1630.4   1.099 |     578.1   174.1 |    1800.0   610.8    0.707  10.4% | ok
+   4    512      8.00 |    1794.3   0.999 |     582.1   172.9 |    1833.1   599.8    0.933   2.2% | ok
+  16    128      2.00 |    5214.9   0.344 |     592.0   170.0 |    5271.4   208.6    0.904   1.1% | ok
+
+seg_eff = t_full/t_seg (segmentation-only GEMM efficiency).
+ovl_eff = (t_seg + t_comm - t_ovl) / min(t_seg, t_comm); 1.0 means the
+shorter phase is fully hidden. bub% = t_ovl over max(t_seg, t_comm).
+The sweet spot is the S with the lowest t_ovl: finer chunks start compute
+earlier but pay tile quantization + per-chunk signalling; coarser chunks
+expose the first chunk's flight time.

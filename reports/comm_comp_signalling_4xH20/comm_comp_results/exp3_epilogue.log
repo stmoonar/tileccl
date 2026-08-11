@@ -1,0 +1,50 @@
+=== exp3: epilogue remote write vs local write (sm90) ===
+world 4, GEMM on GPU 0, remote peer GPU 1
+GPU 0: NVIDIA H20  sm_90  78 SMs  1980 MHz
+GPU 1: NVIDIA H20  sm_90  78 SMs  1980 MHz
+GPU 2: NVIDIA H20  sm_90  78 SMs  1980 MHz
+GPU 3: NVIDIA H20  sm_90  78 SMs  1980 MHz
+[note] flux sm90 GEMM+RS deliberately does NOT remote-write in the epilogue
+(it TMA-stores locally and pulls); its sm80 path does. This measures that choice.
+
+--- 8192x8192x8192 fp16 (D 128 MiB, 8192.0 flop/byte-of-D) ---
+epi     mode          |   us/iter       p95   slowdn  TFLOP/s |    D GB/s | ver
+tma     local         |    7898.5    7912.0    1.000    139.2 |      17.0 | ref
+tma     remote        |    7898.3    7901.4    1.000    139.2 |      17.0 | ok
+tma     scatter-local |    8201.0    8204.5    1.038    134.1 |      16.4 | ok
+tma     scatter       |    8252.7    8255.4    1.045    133.2 |      16.3 | ok
+nosmem  local         |    7990.5    7993.3    1.000    137.6 |      16.8 | ref
+nosmem  remote        |    8238.4    8258.1    1.031    133.5 |      16.3 | ok
+nosmem  scatter-local |    8319.8    8322.3    1.041    132.2 |      16.1 | ok
+nosmem  scatter       |    9025.0    9048.3    1.129    121.8 |      14.9 | ok
+
+--- 8192x8192x2048 fp16 (D 128 MiB, 2048.0 flop/byte-of-D) ---
+epi     mode          |   us/iter       p95   slowdn  TFLOP/s |    D GB/s | ver
+tma     local         |    2019.7    2024.3    1.000    136.1 |      66.5 | ref
+tma     remote        |    2036.4    2037.8    1.008    135.0 |      65.9 | ok
+tma     scatter-local |    2111.9    2113.0    1.046    130.2 |      63.6 | ok
+tma     scatter       |    2174.4    2176.5    1.077    126.4 |      61.7 | ok
+nosmem  local         |    2133.2    2138.6    1.000    128.9 |      62.9 | ref
+nosmem  remote        |    3153.0    3251.1    1.478     87.2 |      42.6 | ok
+nosmem  scatter-local |    2243.9    2246.0    1.052    122.5 |      59.8 | ok
+nosmem  scatter       |    3330.6    3372.9    1.561     82.5 |      40.3 | ok
+
+--- 8192x8192x512 fp16 (D 128 MiB, 512.0 flop/byte-of-D) ---
+epi     mode          |   us/iter       p95   slowdn  TFLOP/s |    D GB/s | ver
+tma     local         |     551.0     551.4    1.000    124.7 |     243.6 | ref
+tma     remote        |     570.7     573.3    1.036    120.4 |     235.2 | ok
+tma     scatter-local |     590.1     590.8    1.071    116.4 |     227.4 | ok
+tma     scatter       |     653.2     655.2    1.185    105.2 |     205.5 | ok
+nosmem  local         |     666.3     671.7    1.000    103.1 |     201.4 | ref
+nosmem  remote        |    2705.5    2716.0    4.061     25.4 |      49.6 | ok
+nosmem  scatter-local |     725.7     728.1    1.089     94.7 |     185.0 | ok
+nosmem  scatter       |    2295.3    2300.6    3.445     29.9 |      58.5 | ok
+
+slowdn = iter time / same-epilogue local baseline.
+remote vs local      : full NVLink write pressure from the epilogue
+scatter vs scatter-local : the realistic GEMM+RS pattern (1/world local)
+tma vs nosmem        : is the penalty specific to TMA descriptors over
+                       peer memory, or generic to remote stores?
+If 'remote' is close to 1.0, flux's sm90 pull-based RS is leaving
+nothing on the table latency-wise; if it is >> 1.0, the pull design is
+justified on Hopper NVLink.

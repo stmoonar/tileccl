@@ -1,0 +1,25 @@
+== comm_comp run_all 20260810_053932 (QUICK=0) ==
+-- building (make -j4) --
+>> exp1_default: ./exp1_ce_interference --sizes 2048,4096,8192 --window-ms 200 --csv results_20260810_053932/exp1_default.csv (timeout 2400s)
+   exp1_default rc=0 dur=13s
+>> exp1_msgsweep: ./exp1_ce_interference --sizes 8192 --patterns pull,allgather --msgs 1M,4M,16M,64M,256M --comm-buf 2G --window-ms 200 --csv results_20260810_053932/exp1_msgsweep.csv (timeout 2400s)
+   exp1_msgsweep rc=0 dur=8s
+>> exp2_verify: ./exp2_ag_gemm_granularity --sizes 8192 --chunks 1,4,16 --iters 10 --verify (timeout 900s)
+   exp2_verify rc=0 dur=4s
+>> exp2_pull: ./exp2_ag_gemm_granularity --sizes 8192,16384x8192x8192 --window-ms 200 --csv results_20260810_053932/exp2_pull.csv (timeout 2400s)
+   exp2_pull rc=0 dur=9s
+>> exp2_serial: ./exp2_ag_gemm_granularity --sizes 8192 --comm-streams 1 --window-ms 200 --csv results_20260810_053932/exp2_serial.csv (timeout 1500s)
+   exp2_serial rc=0 dur=5s
+>> exp2_push: ./exp2_ag_gemm_granularity --sizes 8192 --push --window-ms 200 --csv results_20260810_053932/exp2_push.csv (timeout 1500s)
+   exp2_push rc=0 dur=6s
+>> exp3_epilogue: ./exp3_epilogue_remote --verify --window-ms 200 --csv results_20260810_053932/exp3_epilogue.csv (timeout 2400s)
+   exp3_epilogue rc=0 dur=11s
+>> exp3_fused_8192: ./exp3_gemm_rs_fused --iters 50 --verify --csv results_20260810_053932/exp3_fused.csv (timeout 900s)
+   exp3_fused_8192 rc=0 dur=5s
+>> exp3_fused_k2048: ./exp3_gemm_rs_fused --m 8192 --n 8192 --k 2048 --iters 50 --verify --csv results_20260810_053932/exp3_fused.csv (timeout 900s)
+   exp3_fused_k2048 rc=0 dur=5s
+>> exp3_fused_k512: ./exp3_gemm_rs_fused --m 8192 --n 8192 --k 512 --iters 50 --verify --csv results_20260810_053932/exp3_fused.csv (timeout 900s)
+   exp3_fused_k512 rc=0 dur=4s
+-- done; packing --
+packed: comm_comp/results_20260810_053932.tar.gz (no zip on box)
+== all done ==
