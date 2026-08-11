@@ -122,8 +122,16 @@ cleanup_fused() {
 
 if [ "$QUICK" = "1" ]; then
   WIN=100; ITERS_FUSED=20; SIZES1="4096,8192"; SIZES2="8192"
+  MSWEEP_V1="512x8192x8192"
+  MSWEEP_V2="2048"
 else
   WIN=200; ITERS_FUSED=50; SIZES1="2048,4096,8192"; SIZES2="8192,16384x8192x8192"
+  # M-sweep at fixed K=8192: flop/byte-of-D is constant, so any tax growth at
+  # small M is a granularity/latency effect (few tiles, shallow waves, fixed
+  # sync overheads), not a bandwidth one -- the axis the flux paper sweeps
+  # (their decode points m=64/512), orthogonal to our K sweep.
+  MSWEEP_V1="64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192"
+  MSWEEP_V2="512 1024 2048 4096"
 fi
 
 # ---------------------------------------------------------------------------
@@ -153,6 +161,13 @@ run exp2_push 1500 ./exp2_ag_gemm_granularity \
 # ---------------------------------------------------------------------------
 run exp3_epilogue 2400 ./exp3_epilogue_remote \
     --verify --window-ms "$WIN" --csv "$OUT/exp3_epilogue.csv"
+# M-sweep companion (fixed K): remote-write tax should stay flat vs M (the
+# intensity K is unchanged); a rise at small M isolates partial-tile / launch
+# granularity effects. m=64 mirrors the flux paper's smallest decode point;
+# the fused kernel below cannot reach it (M % (tile_M*world) == 0).
+run exp3_epilogue_msweep 2400 ./exp3_epilogue_remote \
+    --sizes "$MSWEEP_V1" --verify --window-ms "$WIN" \
+    --csv "$OUT/exp3_epilogue_msweep.csv"
 
 # ---------------------------------------------------------------------------
 # exp3 v2: fused GEMM+RS (multi-process; pkill leftovers after each)
@@ -168,6 +183,17 @@ run exp3_fused_k512 900 ./exp3_gemm_rs_fused \
     --m 8192 --n 8192 --k 512 --iters "$ITERS_FUSED" --verify \
     --csv "$OUT/exp3_fused.csv"
 cleanup_fused
+
+# M-sweep at fixed K=8192 (m=8192 point == exp3_fused_8192 above). Comm and
+# compute shrink together here, so comm_sd should hold ~constant until the
+# per-rank tile count gets too small to fill waves / hide flag latency --
+# the paper's small-m failure mode, distinct from the small-K floor above.
+for m in $MSWEEP_V2; do
+  run "exp3_fused_m${m}" 900 ./exp3_gemm_rs_fused \
+      --m "$m" --n 8192 --k 8192 --iters "$ITERS_FUSED" --verify \
+      --csv "$OUT/exp3_fused_msweep.csv"
+  cleanup_fused
+done
 
 # ---------------------------------------------------------------------------
 # wrap up
