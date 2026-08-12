@@ -61,6 +61,7 @@ struct Config {
   int comm_streams = 0;           // 0 = one per peer, 1 = single serial stream
   bool push = false;              // copies issued by the peers' CEs instead
   double window_ms = 200;
+  double warmup_ms = 0;           // wall-clock warmup floor (0 = legacy)
   int iters = 0;                  // pipeline iterations, 0 = auto
   int gemm_dev = 0;
   int ndev = 0;
@@ -106,6 +107,7 @@ static Config parse_args(int argc, char** argv) {
     } else if (a == "--comm-streams") c.comm_streams = std::atoi(next().c_str());
     else if (a == "--push") c.push = true;
     else if (a == "--window-ms") c.window_ms = std::atof(next().c_str());
+    else if (a == "--warmup-ms") c.warmup_ms = std::atof(next().c_str());
     else if (a == "--iters") c.iters = std::atoi(next().c_str());
     else if (a == "--gemm-dev") c.gemm_dev = std::atoi(next().c_str());
     else if (a == "--ndev") c.ndev = std::atoi(next().c_str());
@@ -531,7 +533,9 @@ int main(int argc, char** argv) {
       }
 
       // components
-      const Stats seg = p.run_seg_alone(2, 10);
+      const Stats seg =
+          p.run_seg_alone(iters_for_ms(cfg.warmup_ms, t_full_us, 2,
+                                           kMaxPipeIters), 10);
       const double comm_us = p.run_comm_alone_us(10);
       const double comm_gbps = ag_bytes / (comm_us * 1e-6) / 1e9;
 
@@ -542,7 +546,9 @@ int main(int argc, char** argv) {
                       : (int)std::max(5.0, std::min((double)kMaxPipeIters,
                                                     cfg.window_ms * 1000.0 /
                                                         std::max(1.0, est_us)));
-      const Stats ovl = p.run_pipeline(2, iters);
+      // warmup budgeted in wall clock, not iterations -- see iters_for_ms
+      const Stats ovl = p.run_pipeline(
+          iters_for_ms(cfg.warmup_ms, est_us, 2, kMaxPipeIters), iters);
 
       const double seg_eff = seg.mean > 0 ? t_full_us / seg.mean : 0;
       const double ovl_eff =

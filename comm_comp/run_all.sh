@@ -120,12 +120,19 @@ cleanup_fused() {
   true
 }
 
+# WARM: wall-clock warmup floor, passed to every experiment. A fixed warmup
+# ITERATION count is a shape-dependent amount of wall clock -- 30 iterations is
+# 0.68 s at M=32768 but 0.022 s at M=512 -- so small shapes get timed before
+# they reach steady state. Every ratio here is doubly exposed, because the
+# denominator (alone / local / base) is timed FIRST and absorbs the transient.
+# 500 ms warms every shape equally; costs ~4 min across the suite.
 if [ "$QUICK" = "1" ]; then
-  WIN=100; ITERS_FUSED=20; SIZES1="4096,8192"; SIZES2="8192"
+  WIN=100; ITERS_FUSED=40; WARM=50; SIZES1="4096,8192"; SIZES2="8192"
   MSWEEP_V1="512x8192x8192"
   MSWEEP_V2="2048"
 else
-  WIN=200; ITERS_FUSED=50; SIZES1="2048,4096,8192"; SIZES2="8192,16384x8192x8192"
+  WIN=200; ITERS_FUSED=300; WARM=500
+  SIZES1="2048,4096,8192"; SIZES2="8192,16384x8192x8192"
   # M-sweep at fixed K=8192: flop/byte-of-D is constant, so any tax growth at
   # small M is a granularity/latency effect (few tiles, shallow waves, fixed
   # sync overheads), not a bandwidth one -- the axis the flux paper sweeps
@@ -133,18 +140,20 @@ else
   # (m=8192 comes from the default exp3 runs; above it the sweep checks the
   # large-M plateau -- comm_sd should stay flat once waves are saturated)
   MSWEEP_V1="64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192,16384x8192x8192,32768x8192x8192"
-  MSWEEP_V2="512 1024 2048 4096 16384 32768"
+  MSWEEP_V2="512 1024 2048 4096 8192 16384 32768"
 fi
 
 # ---------------------------------------------------------------------------
 # exp1: CE traffic vs independent GEMM
 # ---------------------------------------------------------------------------
 run exp1_default 2400 ./exp1_ce_interference \
-    --sizes "$SIZES1" --window-ms "$WIN" --csv "$OUT/exp1_default.csv"
+    --sizes "$SIZES1" --window-ms "$WIN" --warmup-ms "$WARM" \
+    --csv "$OUT/exp1_default.csv"
 # --comm-buf 2G so the 256M point fits a slot even at world=8 (slot = buf/7)
 run exp1_msgsweep 2400 ./exp1_ce_interference \
     --sizes 8192 --patterns pull,allgather --msgs 1M,4M,16M,64M,256M \
-    --comm-buf 2G --window-ms "$WIN" --csv "$OUT/exp1_msgsweep.csv"
+    --comm-buf 2G --window-ms "$WIN" --warmup-ms "$WARM" \
+    --csv "$OUT/exp1_msgsweep.csv"
 
 # ---------------------------------------------------------------------------
 # exp2: AG+GEMM granularity sweep (verify first, then the sweeps)
@@ -152,37 +161,44 @@ run exp1_msgsweep 2400 ./exp1_ce_interference \
 run exp2_verify 900 ./exp2_ag_gemm_granularity \
     --sizes 8192 --chunks 1,4,16 --iters 10 --verify
 run exp2_pull 2400 ./exp2_ag_gemm_granularity \
-    --sizes "$SIZES2" --window-ms "$WIN" --csv "$OUT/exp2_pull.csv"
+    --sizes "$SIZES2" --window-ms "$WIN" --warmup-ms "$WARM" \
+    --csv "$OUT/exp2_pull.csv"
 run exp2_serial 1500 ./exp2_ag_gemm_granularity \
-    --sizes 8192 --comm-streams 1 --window-ms "$WIN" --csv "$OUT/exp2_serial.csv"
+    --sizes 8192 --comm-streams 1 --window-ms "$WIN" --warmup-ms "$WARM" \
+    --csv "$OUT/exp2_serial.csv"
 run exp2_push 1500 ./exp2_ag_gemm_granularity \
-    --sizes 8192 --push --window-ms "$WIN" --csv "$OUT/exp2_push.csv"
+    --sizes 8192 --push --window-ms "$WIN" --warmup-ms "$WARM" \
+    --csv "$OUT/exp2_push.csv"
 
 # ---------------------------------------------------------------------------
 # exp3 v1: epilogue remote write (TMA + nosmem epilogues, all modes)
 # ---------------------------------------------------------------------------
 run exp3_epilogue 2400 ./exp3_epilogue_remote \
-    --verify --window-ms "$WIN" --csv "$OUT/exp3_epilogue.csv"
+    --verify --window-ms "$WIN" --warmup-ms "$WARM" \
+    --csv "$OUT/exp3_epilogue.csv"
 # M-sweep companion (fixed K): remote-write tax should stay flat vs M (the
 # intensity K is unchanged); a rise at small M isolates partial-tile / launch
 # granularity effects. m=64 mirrors the flux paper's smallest decode point;
 # the fused kernel below cannot reach it (M % (tile_M*world) == 0).
 run exp3_epilogue_msweep 2400 ./exp3_epilogue_remote \
-    --sizes "$MSWEEP_V1" --verify --window-ms "$WIN" \
+    --sizes "$MSWEEP_V1" --verify --window-ms "$WIN" --warmup-ms "$WARM" \
     --csv "$OUT/exp3_epilogue_msweep.csv"
 
 # ---------------------------------------------------------------------------
 # exp3 v2: fused GEMM+RS (multi-process; pkill leftovers after each)
 # ---------------------------------------------------------------------------
 run exp3_fused_8192 900 ./exp3_gemm_rs_fused \
-    --iters "$ITERS_FUSED" --verify --csv "$OUT/exp3_fused.csv"
+    --iters "$ITERS_FUSED" --warmup-ms "$WARM" --verify \
+    --csv "$OUT/exp3_fused.csv"
 cleanup_fused
 run exp3_fused_k2048 900 ./exp3_gemm_rs_fused \
-    --m 8192 --n 8192 --k 2048 --iters "$ITERS_FUSED" --verify \
+    --m 8192 --n 8192 --k 2048 --iters "$ITERS_FUSED" --warmup-ms "$WARM" \
+    --verify \
     --csv "$OUT/exp3_fused.csv"
 cleanup_fused
 run exp3_fused_k512 900 ./exp3_gemm_rs_fused \
-    --m 8192 --n 8192 --k 512 --iters "$ITERS_FUSED" --verify \
+    --m 8192 --n 8192 --k 512 --iters "$ITERS_FUSED" --warmup-ms "$WARM" \
+    --verify \
     --csv "$OUT/exp3_fused.csv"
 cleanup_fused
 
@@ -192,7 +208,8 @@ cleanup_fused
 # the paper's small-m failure mode, distinct from the small-K floor above.
 for m in $MSWEEP_V2; do
   run "exp3_fused_m${m}" 900 ./exp3_gemm_rs_fused \
-      --m "$m" --n 8192 --k 8192 --iters "$ITERS_FUSED" --verify \
+      --m "$m" --n 8192 --k 8192 --iters "$ITERS_FUSED" --warmup-ms "$WARM" \
+      --verify --dump-iters "$OUT/iters_fused_m${m}" \
       --csv "$OUT/exp3_fused_msweep.csv"
   cleanup_fused
 done

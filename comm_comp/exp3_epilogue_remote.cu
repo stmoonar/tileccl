@@ -60,6 +60,7 @@ struct Config {
   std::vector<std::string> epis;   // tma, nosmem
   int peer = -1;                   // -1 = (gemm_dev + 1) % world
   double window_ms = 200;
+  double warmup_ms = 0;  // wall-clock warmup floor (0 = legacy)
   int iters = 0;
   int gemm_dev = 0;
   int ndev = 0;
@@ -102,6 +103,7 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--epi") c.epis = split_csv(next());
     else if (a == "--peer") c.peer = std::atoi(next().c_str());
     else if (a == "--window-ms") c.window_ms = std::atof(next().c_str());
+    else if (a == "--warmup-ms") c.warmup_ms = std::atof(next().c_str());
     else if (a == "--iters") c.iters = std::atoi(next().c_str());
     else if (a == "--gemm-dev") c.gemm_dev = std::atoi(next().c_str());
     else if (a == "--ndev") c.ndev = std::atoi(next().c_str());
@@ -348,7 +350,12 @@ int main(int argc, char** argv) {
                   : (int)std::max(5.0, std::min((double)kMaxIters,
                                                 cfg.window_ms * 1000.0 /
                                                     std::max(1.0, probe.mean)));
-          st = bench.time(*p, 2, iters);
+          // warmup budgeted in wall clock, not iterations -- see
+          // iters_for_ms. Matters most here: `local` is the ratio's
+          // denominator AND is timed first.
+          st = bench.time(
+              *p, iters_for_ms(cfg.warmup_ms, probe.mean, 2, kMaxIters),
+              iters);
         }
         if (mode == "local") local_us = st.mean;
         const double slowdown = local_us > 0 ? st.mean / local_us : 0;

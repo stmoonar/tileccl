@@ -105,6 +105,25 @@ inline Shape3 parse_shape(const std::string& tok) {
 }
 
 // ---------------------------------------------------------------------------
+// iteration budgeting
+// ---------------------------------------------------------------------------
+
+// How many iterations fill `ms` milliseconds at `per_iter_us` each, clamped to
+// [lo, hi]. Use this for WARMUP counts as well as timed counts.
+//
+// A hardcoded warmup count is a shape-dependent amount of wall clock: in the
+// fused GEMM+RS experiment, 30 iterations is 0.68 s at M=32768 but 0.022 s at
+// M=512, and the small shapes were still speeding up well into their timed
+// window (fused drifted -4.8% across it at M=512, and not at all from M=2048
+// up). Anything that reports a RATIO is doubly exposed, because whichever
+// variant is timed first absorbs the transient and biases the ratio on its own.
+inline int iters_for_ms(double ms, double per_iter_us, int lo, int hi) {
+  if (per_iter_us <= 0) return lo;
+  const double n = ms * 1000.0 / per_iter_us;
+  return (int)std::max((double)lo, std::min((double)hi, n));
+}
+
+// ---------------------------------------------------------------------------
 // stats
 // ---------------------------------------------------------------------------
 

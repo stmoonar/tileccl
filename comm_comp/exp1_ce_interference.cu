@@ -61,6 +61,7 @@ struct Config {
   std::vector<uint64_t> msgs;
   uint64_t comm_buf = 1ull << 30;  // per (dst-rank) cycling region
   double window_ms = 200;
+  double warmup_ms = 0;  // wall-clock warmup floor (0 = legacy fixed count)
   int iters = 0;  // 0 = auto from window
   int gemm_dev = 0;
   int ndev = 0;  // 0 = all visible
@@ -101,6 +102,7 @@ static Config parse_args(int argc, char** argv) {
       for (const auto& t : split_csv(next())) c.msgs.push_back(parse_bytes(t));
     } else if (a == "--comm-buf") c.comm_buf = parse_bytes(next());
     else if (a == "--window-ms") c.window_ms = std::atof(next().c_str());
+    else if (a == "--warmup-ms") c.warmup_ms = std::atof(next().c_str());
     else if (a == "--iters") c.iters = std::atoi(next().c_str());
     else if (a == "--gemm-dev") c.gemm_dev = std::atoi(next().c_str());
     else if (a == "--ndev") c.ndev = std::atoi(next().c_str());
@@ -508,7 +510,9 @@ int main(int argc, char** argv) {
                     : (int)std::max(5.0, std::min((double)kMaxIters,
                                                   cfg.window_ms * 1000.0 /
                                                       std::max(1.0, est_us)));
-    g.enqueue_timed(3, iters);
+    // warmup budgeted in wall clock, not iterations -- see iters_for_ms
+    const int warm = iters_for_ms(cfg.warmup_ms, est_us, 3, kMaxIters);
+    g.enqueue_timed(warm, iters);
     CUDA_CHECK(cudaEventSynchronize(g.e_end));
     const Stats alone = g.collect(iters);
     const double tflops_alone = g.flop() / (alone.mean * 1e-6) / 1e12;
@@ -532,7 +536,7 @@ int main(int argc, char** argv) {
         Pump pump;
         pump.start(&legs, cal.chunk_msgs);
         const auto t0 = std::chrono::steady_clock::now();
-        g.enqueue_timed(3, iters, [&] { pump.poll(); });
+        g.enqueue_timed(warm, iters, [&] { pump.poll(); });
         CUDA_CHECK(cudaSetDevice(cfg.gemm_dev));
         while (cudaEventQuery(g.e_end) != cudaSuccess) {
           pump.poll();
@@ -580,7 +584,7 @@ int main(int argc, char** argv) {
     // above is a ratio against the *opening* baseline, so environmental drift
     // (another job landing on the box, clocks sagging) silently pollutes all
     // of them; this makes it visible and flags the whole block.
-    g.enqueue_timed(3, iters);
+    g.enqueue_timed(warm, iters);
     CUDA_CHECK(cudaEventSynchronize(g.e_end));
     const Stats alone2 = g.collect(iters);
     const double drift =
