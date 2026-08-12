@@ -242,14 +242,24 @@ load_clock_check() {
         "($((100 * avg / idle))%)."
     log "   The clock is NOT locked where it matters. Ratios measured"
     log "   back-to-back still hold; absolute us/TFLOP/s and anything compared"
-    log "   across minutes do not. Re-lock at a clock the box can sustain"
-    log "   (try: nvidia-smi -lgc ${avg} -i $dev) or accept ratios only."
-    [ "${FORCE:-0}" = 1 ] || log "   (continuing anyway -- this is a warning, not an abort)"
+    log "   across minutes do not."
+    log "   Find a clock this box can actually sustain:  ./pick_clock.sh"
+    log "   then lock it:  nvidia-smi -lgc <freq> -i $dev"
+    if [ "${FORCE:-0}" = 1 ]; then
+      log "!! FORCE=1 -- continuing; absolute numbers in this run are NOT"
+      log "   comparable across time and must not be quoted as such"
+    else
+      log "!! aborting: a 40-minute run at an uncontrolled clock is worse than"
+      log "   no run (the numbers look real). FORCE=1 to override."
+      stop_sampler
+      exit 1
+    fi
   fi
 }
-load_clock_check
-
+# sampler first, so the trace covers the clock check itself -- if the check
+# fails, its own 4 s of load is already recorded as evidence
 start_sampler
+load_clock_check
 
 # ---------------------------------------------------------------------------
 # exp1: CE traffic vs independent GEMM
