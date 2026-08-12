@@ -60,6 +60,7 @@ log "== comm_comp run_all $STAMP (QUICK=$QUICK) =="
 ids=""
 [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && ids="-i $CUDA_VISIBLE_DEVICES"
 bad=0
+REF_IDLE_CLOCK=0
 while IFS=',' read -r idx util mem sm smmax; do
   idx=${idx// /}; util=${util// /}; mem=${mem// /}
   sm=${sm// /}; smmax=${smmax// /}
@@ -74,6 +75,8 @@ while IFS=',' read -r idx util mem sm smmax; do
     log "!! GPU $idx: SM clock ${sm} MHz (max ${smmax}) -- looks UNLOCKED;" \
         "run: nvidia-smi -lgc <freq> -i ${CUDA_VISIBLE_DEVICES:-0,1,2,3}"; bad=1
   fi
+  # remember what idle looked like; load_clock_check compares against it
+  [ "${REF_IDLE_CLOCK:-0}" = 0 ] && REF_IDLE_CLOCK=$sm
 done < <(nvidia-smi $ids \
     --query-gpu=index,utilization.gpu,memory.used,clocks.sm,clocks.max.sm \
     --format=csv,noheader,nounits 2>/dev/null)
@@ -186,6 +189,65 @@ else
   MSWEEP_V1="64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192,16384x8192x8192,32768x8192x8192"
   MSWEEP_V2="512 1024 2048 4096 8192 16384 32768"
 fi
+
+# ---------------------------------------------------------------------------
+# under-load clock check
+# ---------------------------------------------------------------------------
+# The idle check above is necessary but NOT sufficient, and the difference is
+# not academic: on this box `nvidia-smi -lgc 1830` holds 1830 MHz at idle
+# (97.9% of idle samples) and then collapses to a median of 1380 MHz under
+# sustained GEMM, with sw_power_cap active in 79% of loaded samples at ~600 W.
+# Idle is precisely when the power cap is NOT engaged, so the check that was
+# there could never have caught it. Every "locked clocks" claim in the
+# 20260810/11/12 reports rests on that idle reading.
+#
+# So: generate real load, sample the clock during it, and compare against what
+# the idle check saw. Ratios taken back-to-back survive a drooping clock (both
+# sides see the same one); absolute us/TFLOP/s and any comparison across
+# minutes do not.
+load_clock_check() {
+  local dev=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+  local first=${dev%%,*}
+  [ -x ./exp3_epilogue_remote ] || { log "-- load clock check SKIPPED --"; return; }
+  log "-- under-load clock check (4 s of 8192^3 GEMM) --"
+  ./exp3_epilogue_remote --sizes 8192x8192x8192 --modes local \
+      --window-ms 2000 --warmup-ms 2000 > "$OUT/load_check.log" 2>&1 &
+  local job=$!
+  local samples=""
+  for _ in $(seq 1 20); do
+    sleep 0.2
+    local row
+    row=$(nvidia-smi -i "$first" --query-gpu=clocks.sm,power.draw \
+          --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    case "$row" in
+      *,*) [ "${row#*,}" != "" ] && samples="$samples ${row%%,*}" ;;
+    esac
+  done
+  wait $job 2>/dev/null
+  local n=0 sum=0 lo=999999
+  for c in $samples; do
+    case "$c" in *[!0-9]*) continue ;; esac
+    n=$((n + 1)); sum=$((sum + c))
+    [ "$c" -lt "$lo" ] && lo=$c
+  done
+  if [ "$n" -lt 5 ]; then
+    log "!! load clock check: only $n usable samples -- inconclusive"
+    return
+  fi
+  local avg=$((sum / n))
+  log "   GPU $first under load: mean ${avg} MHz, min ${lo} MHz over $n samples"
+  local idle=${REF_IDLE_CLOCK:-0}
+  if [ "$idle" -gt 0 ] && [ "$avg" -lt $((idle * 95 / 100)) ]; then
+    log "!! SM clock droops to ${avg} MHz under load vs ${idle} MHz at idle" \
+        "($((100 * avg / idle))%)."
+    log "   The clock is NOT locked where it matters. Ratios measured"
+    log "   back-to-back still hold; absolute us/TFLOP/s and anything compared"
+    log "   across minutes do not. Re-lock at a clock the box can sustain"
+    log "   (try: nvidia-smi -lgc ${avg} -i $dev) or accept ratios only."
+    [ "${FORCE:-0}" = 1 ] || log "   (continuing anyway -- this is a warning, not an abort)"
+  fi
+}
+load_clock_check
 
 start_sampler
 
