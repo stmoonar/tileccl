@@ -145,7 +145,21 @@ def step1(outdir):
         "\n  16384 -> 32768:  comm_sd(mean) %+.3f,  comm_sd(p50) %+.3f"
         % (d_mean, d_p50)
     )
-    if d_p50 < 0.02 and d_mean > 0.04:
+    if d_mean < 0.02 and d_p50 < 0.02:
+        # Neither view shows a rise: the effect the rerun was built to explain
+        # is simply not there. This must be its own branch -- treating it as
+        # "TAIL" or "MIXED" would let step 2 go on to localise a cost that does
+        # not exist, and any ratio it prints is then noise over noise.
+        verdict = "NOT REPRODUCED"
+        print(
+            "  VERDICT: NOT REPRODUCED. comm_sd is flat across the two shapes on\n"
+            "           BOTH views -- the 20260811 upturn was a measurement\n"
+            "           artefact of that run, not a property of the kernel.\n"
+            "           Steps 2 and 3 have no anomaly to localise; read step 2's\n"
+            "           rows as a plain large-M K-sweep and check step 4 for what\n"
+            "           the old run most likely caught."
+        )
+    elif d_p50 < 0.02 and d_mean > 0.04:
         verdict = "TAIL"
         print(
             "  VERDICT: TAIL. The median tax is flat -- the large-M plateau\n"
@@ -182,28 +196,33 @@ def step2(outdir, s1, s1_verdict):
     print("=" * 78)
     print("STEP 2  does the cost track TILES or DURATION?")
     print("=" * 78)
-    print("        comm_sd is NOT comparable across these rows (K moves the")
-    print("        denominator). Read C = fused-ctrl, in absolute us.")
-    if s1_verdict == "TAIL":
-        print()
-        print("        NOTE: step 1 ruled TAIL, i.e. there is no median-level")
-        print("        excess to localise. The rows below are still worth")
-        print("        reading for the C-per-tile trend, but the verdict is")
-        print("        moot -- chase the tail (step 4) instead.")
+    print("        C across rows is comparable; comm_sd is NOT (K moves the")
+    print("        denominator) -- but comm_sd is still the right read WITHIN")
+    print("        a row, so both are shown.")
     print()
     print(
         "%7s %6s %6s %7s %8s | %9s %9s | %8s %8s"
         % ("M", "K", "tiles", "pullMi", "dur ms", "C avg us", "C p50 us",
-           "us/ktile", "us/ms")
+           "comm p50", "pull GB/s")
     )
     for s in sorted(shapes, key=lambda s: (-s["m"], s["k"])):
         dur = s["fused"] / 1000.0
         print(
-            "%7d %6d %6d %7.0f %8.2f | %9.1f %9.1f | %8.1f %8.1f"
+            "%7d %6d %6d %7.0f %8.2f | %9.1f %9.1f | %8.3f %8.1f"
             % (s["m"], s["k"], s["tiles"], s["pull_mib"], dur, s["c_abs"],
-               s["c_p50"], 1000.0 * s["c_p50"] / s["tiles"],
-               s["c_p50"] / dur)
+               s["c_p50"], s["comm_p50"],
+               s["pull_mib"] * 2**20 / (s["fused"] * 1e-6) / 1e9)
         )
+
+    if s1_verdict in ("NOT REPRODUCED", "TAIL"):
+        print(
+            "\n  step 1 found no median-level excess at M=32768, so there is\n"
+            "  nothing here to localise and the tiles-vs-duration test is moot.\n"
+            "  Read these rows instead as a K-sweep at large M: comm p50 vs K\n"
+            "  shows whether high arithmetic intensity still buys the overlap\n"
+            "  once M is large."
+        )
+        return
 
     anom = find(shapes, 32768, 8192)
     same_tiles = find(shapes, 32768, 4096)   # tiles held, duration halved
@@ -311,7 +330,7 @@ def step4(outdir):
         "%-20s %4s %7s %8s %8s %6s %7s %8s"
         % ("tag", "rank", "p50", "mean", "max", ">5%", "1st 3rd", "last 3rd")
     )
-    drifts = []
+    drifts = {}
     for path in dumps:
         name = os.path.basename(path)
         tag = name[len("iters_"):].split(".rank")[0]
@@ -328,7 +347,14 @@ def step4(outdir):
         first_m = statistics.median(series[:third])
         last_m = statistics.median(series[-third:])
         slow = sum(1 for x in series if x > 1.05 * p50)
-        drifts.append((last_m - first_m) / first_m)
+        drift = (last_m - first_m) / first_m
+        # A `_rev` point timed fused FIRST, i.e. from a cold/unsettled GPU;
+        # drift there is the experiment working, not a defect. Only the
+        # forward points describe the configuration every report was measured
+        # in, so the two must be scored separately or they cancel out.
+        drifts.setdefault("reverse" if "_rev" in tag else "forward", []).append(
+            (tag, rank, drift, 100.0 * slow / len(series))
+        )
         print(
             "%-20s %4s %7.1f %8.1f %8.1f %5d%% %7.1f %8.1f"
             % (tag, rank, p50, avg(series), max(series),
@@ -336,22 +362,43 @@ def step4(outdir):
         )
     if not drifts:
         return
-    worst = max(drifts, key=abs)
-    print(
-        "\n  worst first-third -> last-third drift: %+.1f%%" % (100 * worst)
-    )
-    if abs(worst) > 0.03:
+    print()
+    for kind in ("forward", "reverse"):
+        if kind not in drifts:
+            continue
+        worst = max(drifts[kind], key=lambda t: abs(t[2]))
+        slowest = max(drifts[kind], key=lambda t: t[3])
         print(
-            "  VERDICT: DRIFT. The kernel gets monotonically slower over the run\n"
-            "           -- thermal/power, or state accumulating across iterations\n"
-            "           (flags not fully cleared). This is a harness bug to fix\n"
-            "           before any m=32768 number is quotable."
+            "  %-8s (fused runs %s): worst drift %+.1f%% (%s r%s), most slow"
+            " iters %.0f%% (%s r%s)"
+            % (kind, "last" if kind == "forward" else "first",
+               100 * worst[2], worst[0], worst[1], slowest[3], slowest[0],
+               slowest[1])
+        )
+    fwd = [abs(t[2]) for t in drifts.get("forward", [])]
+    rev = [abs(t[2]) for t in drifts.get("reverse", [])]
+    if fwd and max(fwd) > 0.03:
+        print(
+            "\n  VERDICT: DRIFT IN THE PRODUCTION ORDER. The kernel gets slower\n"
+            "           over the run even with fused timed last -- thermal, or\n"
+            "           state accumulating across iterations. A harness bug: fix\n"
+            "           it before quoting any large-M number."
+        )
+    elif rev and max(rev) > 0.03:
+        print(
+            "\n  VERDICT: WARM-UP SENSITIVITY, NOT DRIFT. The forward points are\n"
+            "           flat; only the reversed ones -- where fused is timed first,\n"
+            "           off an unsettled GPU -- climb and grow tails. Note the sign:\n"
+            "           those runs start FAST and slow down, so a short window at\n"
+            "           the start would under-report, not over-report. This alone\n"
+            "           therefore does NOT explain an inflated historical number --\n"
+            "           check whether the old run was preceded by sustained load\n"
+            "           (accumulated heat) rather than by idle."
         )
     else:
         print(
-            "  VERDICT: NO DRIFT. Slow iterations are isolated events, not a\n"
-            "           downward slope -- consistent with a scheduling/skew\n"
-            "           outlier rather than heating."
+            "\n  VERDICT: NO DRIFT anywhere. Slow iterations are isolated events,\n"
+            "           not a slope."
         )
 
 

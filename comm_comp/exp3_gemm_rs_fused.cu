@@ -579,6 +579,10 @@ int main(int argc, char** argv) {
         const double bp50 = mp.shm->results[r][7];
         const double cp50 = mp.shm->results[r][8];
         const double fp50 = mp.shm->results[r][9];
+        // --order is comma-separated, which would split into extra CSV
+        // columns and shift every field after it; emit it pipe-separated
+        std::string order_csv = cfg.order;
+        std::replace(order_csv.begin(), order_csv.end(), ',', '|');
         std::fprintf(csv,
                      "%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,"
                      "%.4f,%.2f,%.4g,"
@@ -593,7 +597,7 @@ int main(int argc, char** argv) {
                      // absolute comm cost in us: the only cross-shape
                      // comparable metric, since comm_sd's denominator moves
                      // with K
-                     f - c, cfg.order.c_str(), cfg.iters);
+                     f - c, order_csv.c_str(), cfg.iters);
       }
     }
     if (csv) std::fclose(csv);
