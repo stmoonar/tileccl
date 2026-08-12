@@ -90,11 +90,11 @@ def main():
     top.tick_params(labelsize=7, colors=GREY, length=0)
     top.spines["top"].set_visible(False)
 
-    # shape annotation (requested: keep N, K visible)
-    ax.text(0.985, 0.05,
+    # shape annotation, below the plot area (keeps N, K visible)
+    ax.text(0.5, -0.30,
             "GEMM M=N=K=8192, fp16, TP world=4\n"
             "all-gathered shard 2048$\\times$8192 = 32 MiB/rank",
-            transform=ax.transAxes, ha="right", va="bottom", fontsize=7,
+            transform=ax.transAxes, ha="center", va="top", fontsize=7,
             color="#444444")
 
     os.makedirs(OUT, exist_ok=True)
