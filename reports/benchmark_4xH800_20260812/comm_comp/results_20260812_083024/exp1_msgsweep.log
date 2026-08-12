@@ -1,0 +1,26 @@
+=== exp1: CE traffic vs independent sm90 GEMM ===
+world 4, GEMM on GPU 0, fp16 CUTLASS (TmaWarpSpecializedCooperative 128x256x64)
+GPU 0: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 1: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 2: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 3: NVIDIA H800  sm_90  132 SMs  1980 MHz
+[note] lock clocks (nvidia-smi -lgc) before trusting slowdowns.
+
+--- GEMM 8192x8192x8192 fp16: alone 1681.8 us/iter (p95 1692.4), 653.8 TFLOP/s, 118 iters ---
+pattern     msg    |    paired ovl us/iter   ovl p95    S_c  TFLOP/s | alone GB/s   ovl GB/s | note
+pull        1M     |    1676.1      1702.0    1722.5  1.015    646.0 |      80.52     101.16 | [!] CE went idle mid-window
+pull        4M     |    1677.6      1721.3    1730.6  1.026    638.8 |     137.32     173.78 | 
+pull        16M    |    1685.0      1723.0    1739.3  1.023    638.1 |     169.97     175.08 | 
+pull        64M    |    1679.6      1724.4    1756.3  1.027    637.6 |     176.45     175.69 | 
+pull        256M   |    1681.4      1730.8    1754.2  1.029    635.3 |     176.46     176.00 | 
+allgather   1M     |    1686.6      1714.9    1744.1  1.017    641.1 |      86.73     171.61 | [!] CE went idle mid-window
+allgather   4M     |    1680.8      1724.9    1745.6  1.026    637.5 |     158.45     345.01 | [!] CE went idle mid-window
+allgather   16M    |    1682.0      1744.7    1766.3  1.037    630.2 |     264.31     391.95 | 
+allgather   64M    |    1680.1      1739.0    1764.4  1.035    632.3 |     348.50     413.31 | 
+allgather   256M   |    1681.6      1738.8    1768.1  1.034    632.3 |     349.38     392.55 | 
+baseline recheck: alone 1681.8 -> 1761.6 us/iter (drift +4.7%)
+
+S_c = GEMM iter time overlapped / alone. Compare patterns:
+  bystander ~1.00 and pull/push > 1.00  => local HBM contention
+  engine-only ~1.00                     => CE engine itself is free
+  local >= pull/push                    => per-byte HBM cost ordering

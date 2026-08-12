@@ -1,0 +1,42 @@
+=== exp1: CE traffic vs independent sm90 GEMM ===
+world 4, GEMM on GPU 0, fp16 CUTLASS (TmaWarpSpecializedCooperative 128x256x64)
+GPU 0: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 1: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 2: NVIDIA H800  sm_90  132 SMs  1980 MHz
+GPU 3: NVIDIA H800  sm_90  132 SMs  1980 MHz
+[note] lock clocks (nvidia-smi -lgc) before trusting slowdowns.
+
+--- GEMM 2048x2048x2048 fp16: alone 38.1 us/iter (p95 38.3), 451.1 TFLOP/s, 2048 iters ---
+pattern     msg    |    paired ovl us/iter   ovl p95    S_c  TFLOP/s | alone GB/s   ovl GB/s | note
+pull        64M    |      38.0        40.2      41.9  1.058    427.1 |     176.43     166.30 | [!] CE went idle mid-window
+push        64M    |      38.2        38.5      39.5  1.008    446.2 |     176.46     167.26 | [!] CE went idle mid-window
+allgather   64M    |      38.2        47.8      55.2  1.252    359.3 |     348.55     365.69 | [!] CE went idle mid-window
+bystander   64M    |      38.1        38.2      38.5  1.003    449.3 |     316.30     461.31 | [!] CE went idle mid-window
+engine-only 64M    |      37.9        38.0      38.3  1.002    451.7 |     170.78     162.38 | [!] CE went idle mid-window
+local       64M    |      38.4        75.8      78.6  1.975    226.6 |    1384.81     827.97 | [!] CE went idle mid-window
+baseline recheck: alone 38.1 -> 38.2 us/iter (drift +0.3%)
+
+--- GEMM 4096x4096x4096 fp16: alone 224.5 us/iter (p95 225.4), 612.2 TFLOP/s, 872 iters ---
+pattern     msg    |    paired ovl us/iter   ovl p95    S_c  TFLOP/s | alone GB/s   ovl GB/s | note
+pull        64M    |     224.8       227.2     229.5  1.011    604.8 |     176.43     120.08 | [!] CE went idle mid-window
+push        64M    |     224.6       225.4     228.7  1.004    609.7 |     176.46     119.90 | [!] CE went idle mid-window
+allgather   64M    |     226.9       234.9     244.4  1.035    585.2 |     348.80     286.86 | [!] CE went idle mid-window
+bystander   64M    |     224.8       225.8     227.9  1.005    608.5 |     318.41     345.25 | [!] CE went idle mid-window
+engine-only 64M    |     225.5       224.6     225.8  0.996    612.0 |     170.81     115.01 | [!] CE went idle mid-window
+local       64M    |     226.8       252.9     256.4  1.115    543.4 |    1381.12     226.28 | [!] CE went idle mid-window
+baseline recheck: alone 224.5 -> 224.8 us/iter (drift +0.1%)
+
+--- GEMM 8192x8192x8192 fp16: alone 1762.9 us/iter (p95 1802.5), 623.7 TFLOP/s, 116 iters ---
+pattern     msg    |    paired ovl us/iter   ovl p95    S_c  TFLOP/s | alone GB/s   ovl GB/s | note
+pull        64M    |    1682.9      1727.8    1744.4  1.027    636.3 |     176.44     175.76 | 
+push        64M    |    1677.8      1724.4    1738.2  1.028    637.6 |     176.46     175.27 | 
+allgather   64M    |    1682.6      1735.3    1756.2  1.031    633.6 |     348.77     383.45 | 
+bystander   64M    |    1678.1      1700.0    1711.5  1.013    646.8 |     318.42     504.29 | 
+engine-only 64M    |    1682.8      1716.1    1732.0  1.020    640.7 |     170.08     169.26 | 
+local       64M    |    1688.7      1795.3    1893.6  1.063    612.4 |    1381.72     115.05 | 
+baseline recheck: alone 1762.9 -> 1753.2 us/iter (drift -0.5%)
+
+S_c = GEMM iter time overlapped / alone. Compare patterns:
+  bystander ~1.00 and pull/push > 1.00  => local HBM contention
+  engine-only ~1.00                     => CE engine itself is free
+  local >= pull/push                    => per-byte HBM cost ordering

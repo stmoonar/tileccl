@@ -1,0 +1,60 @@
+== comm_comp run_all 20260812_083024 (QUICK=0) ==
+-- building (make -j4) --
+-- gpu sampler started (pid 162338, 100 ms) --
+-- under-load clock check (4 s of 8192^3 GEMM) --
+   GPU 0 under load: mean 1275 MHz, min 1065 MHz over 20 samples
+>> exp1_default: ./exp1_ce_interference --sizes 2048,4096,8192 --window-ms 200 --warmup-ms 500 --csv results_20260812_083024/exp1_default.csv (timeout 2400s)
+   exp1_default epoch_start=1786523440.728382868
+   exp1_default rc=0 dur=30s
+>> exp1_msgsweep: ./exp1_ce_interference --sizes 8192 --patterns pull,allgather --msgs 1M,4M,16M,64M,256M --comm-buf 2G --window-ms 200 --warmup-ms 500 --csv results_20260812_083024/exp1_msgsweep.csv (timeout 2400s)
+   exp1_msgsweep epoch_start=1786523470.978999160
+   exp1_msgsweep rc=0 dur=23s
+>> exp2_verify: ./exp2_ag_gemm_granularity --sizes 8192 --chunks 1,4,16 --iters 10 --verify (timeout 900s)
+   exp2_verify epoch_start=1786523493.999156792
+   exp2_verify rc=0 dur=5s
+>> exp2_pull: ./exp2_ag_gemm_granularity --sizes 8192,16384x8192x8192 --window-ms 200 --warmup-ms 500 --csv results_20260812_083024/exp2_pull.csv (timeout 2400s)
+   exp2_pull epoch_start=1786523499.076206405
+   exp2_pull rc=0 dur=27s
+>> exp2_serial: ./exp2_ag_gemm_granularity --sizes 8192 --comm-streams 1 --window-ms 200 --warmup-ms 500 --csv results_20260812_083024/exp2_serial.csv (timeout 1500s)
+   exp2_serial epoch_start=1786523526.642322184
+   exp2_serial rc=0 dur=19s
+>> exp2_push: ./exp2_ag_gemm_granularity --sizes 8192 --push --window-ms 200 --warmup-ms 500 --csv results_20260812_083024/exp2_push.csv (timeout 1500s)
+   exp2_push epoch_start=1786523545.741760553
+   exp2_push rc=0 dur=18s
+>> exp3_epilogue: ./exp3_epilogue_remote --verify --window-ms 200 --warmup-ms 500 --csv results_20260812_083024/exp3_epilogue.csv (timeout 2400s)
+   exp3_epilogue epoch_start=1786523563.822379519
+   exp3_epilogue rc=0 dur=25s
+>> exp3_epilogue_msweep: ./exp3_epilogue_remote --sizes 64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192,16384x8192x8192,32768x8192x8192 --verify --window-ms 200 --warmup-ms 500 --csv results_20260812_083024/exp3_epilogue_msweep.csv (timeout 2400s)
+   exp3_epilogue_msweep epoch_start=1786523588.747998627
+   exp3_epilogue_msweep rc=0 dur=60s
+>> exp3_fused_8192: ./exp3_gemm_rs_fused --iters 300 --warmup-ms 500 --verify --csv results_20260812_083024/exp3_fused.csv (timeout 900s)
+   exp3_fused_8192 epoch_start=1786523648.570714084
+   exp3_fused_8192 rc=0 dur=9s
+>> exp3_fused_k2048: ./exp3_gemm_rs_fused --m 8192 --n 8192 --k 2048 --iters 300 --warmup-ms 500 --verify --csv results_20260812_083024/exp3_fused.csv (timeout 900s)
+   exp3_fused_k2048 epoch_start=1786523659.202388674
+   exp3_fused_k2048 rc=0 dur=8s
+>> exp3_fused_k512: ./exp3_gemm_rs_fused --m 8192 --n 8192 --k 512 --iters 300 --warmup-ms 500 --verify --csv results_20260812_083024/exp3_fused.csv (timeout 900s)
+   exp3_fused_k512 epoch_start=1786523669.362687106
+   exp3_fused_k512 rc=0 dur=7s
+>> exp3_fused_m512: ./exp3_gemm_rs_fused --m 512 --n 8192 --k 8192 --iters 300 --warmup-ms 500 --verify --dump-iters results_20260812_083024/iters_fused_m512 --csv results_20260812_083024/exp3_fused_msweep.csv (timeout 900s)
+   exp3_fused_m512 epoch_start=1786523678.690874901
+   exp3_fused_m512 rc=0 dur=7s
+>> exp3_fused_m1024: ./exp3_gemm_rs_fused --m 1024 --n 8192 --k 8192 --iters 300 --warmup-ms 500 --verify --dump-iters results_20260812_083024/iters_fused_m1024 --csv results_20260812_083024/exp3_fused_msweep.csv (timeout 900s)
+   exp3_fused_m1024 epoch_start=1786523687.793722931
+   exp3_fused_m1024 rc=0 dur=7s
+>> exp3_fused_m2048: ./exp3_gemm_rs_fused --m 2048 --n 8192 --k 8192 --iters 300 --warmup-ms 500 --verify --dump-iters results_20260812_083024/iters_fused_m2048 --csv results_20260812_083024/exp3_fused_msweep.csv (timeout 900s)
+   exp3_fused_m2048 epoch_start=1786523696.916025400
+   exp3_fused_m2048 rc=0 dur=9s
+>> exp3_fused_m4096: ./exp3_gemm_rs_fused --m 4096 --n 8192 --k 8192 --iters 300 --warmup-ms 500 --verify --dump-iters results_20260812_083024/iters_fused_m4096 --csv results_20260812_083024/exp3_fused_msweep.csv (timeout 900s)
+   exp3_fused_m4096 epoch_start=1786523707.093774068
+   exp3_fused_m4096 rc=0 dur=8s
+>> exp3_fused_m8192: ./exp3_gemm_rs_fused --m 8192 --n 8192 --k 8192 --iters 300 --warmup-ms 500 --verify --dump-iters results_20260812_083024/iters_fused_m8192 --csv results_20260812_083024/exp3_fused_msweep.csv (timeout 900s)
+   exp3_fused_m8192 epoch_start=1786523717.795127486
+   exp3_fused_m8192 rc=0 dur=10s
+>> exp3_fused_m16384: ./exp3_gemm_rs_fused --m 16384 --n 8192 --k 8192 --iters 300 --warmup-ms 500 --verify --dump-iters results_20260812_083024/iters_fused_m16384 --csv results_20260812_083024/exp3_fused_msweep.csv (timeout 900s)
+   exp3_fused_m16384 epoch_start=1786523729.013629926
+   exp3_fused_m16384 rc=0 dur=10s
+>> exp3_fused_m32768: ./exp3_gemm_rs_fused --m 32768 --n 8192 --k 8192 --iters 300 --warmup-ms 500 --verify --dump-iters results_20260812_083024/iters_fused_m32768 --csv results_20260812_083024/exp3_fused_msweep.csv (timeout 900s)
+   exp3_fused_m32768 epoch_start=1786523741.431749176
+   exp3_fused_m32768 rc=0 dur=13s
+-- done; packing --
