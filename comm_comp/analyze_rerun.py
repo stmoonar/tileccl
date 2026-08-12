@@ -420,27 +420,55 @@ def step4(outdir):
         )
     if not drifts:
         return
+    # Rule on the per-tag mean across ranks, not on individual ranks: a single
+    # noisy rank routinely clears a 3% bar on its own and would flip the
+    # verdict on evidence the other three contradict.
     print()
+    per_tag = {}
+    for kind, entries in drifts.items():
+        agg = {}
+        for tag, _rank, drift, _slow in entries:
+            agg.setdefault(tag, []).append(drift)
+        per_tag[kind] = {t: avg(v) for t, v in agg.items()}
     for kind in ("forward", "reverse"):
         if kind not in drifts:
             continue
-        worst = max(drifts[kind], key=lambda t: abs(t[2]))
+        worst = max(per_tag[kind].items(), key=lambda kv: abs(kv[1]))
         slowest = max(drifts[kind], key=lambda t: t[3])
         print(
-            "  %-8s (fused runs %s): worst drift %+.1f%% (%s r%s), most slow"
-            " iters %.0f%% (%s r%s)"
+            "  %-8s (fused runs %s): worst per-shape drift %+.1f%% (%s), most"
+            " slow iters %.0f%% (%s r%s)"
             % (kind, "last" if kind == "forward" else "first",
-               100 * worst[2], worst[0], worst[1], slowest[3], slowest[0],
-               slowest[1])
+               100 * worst[1], worst[0], slowest[3], slowest[0], slowest[1])
         )
-    fwd = [abs(t[2]) for t in drifts.get("forward", [])]
-    rev = [abs(t[2]) for t in drifts.get("reverse", [])]
+    # Sign matters and the two signs mean opposite things. Slowing down over
+    # the run is degradation (thermal, or state piling up across iterations).
+    # Speeding up is the opposite problem: the timed window started before the
+    # kernel reached steady state, i.e. warmup was too short. --warmup counts
+    # ITERATIONS, so its wall-clock value scales with the shape: 30 iterations
+    # is ~0.7 s at M=32768 but ~7 ms at M=512, which is why the small end is
+    # where this shows up.
+    fwd = list(per_tag.get("forward", {}).values())
+    rev = [abs(x) for x in per_tag.get("reverse", {}).values()]
     if fwd and max(fwd) > 0.03:
         print(
-            "\n  VERDICT: DRIFT IN THE PRODUCTION ORDER. The kernel gets slower\n"
-            "           over the run even with fused timed last -- thermal, or\n"
-            "           state accumulating across iterations. A harness bug: fix\n"
-            "           it before quoting any large-M number."
+            "\n  VERDICT: DEGRADATION IN THE PRODUCTION ORDER (%+.1f%%). The kernel\n"
+            "           gets SLOWER over the run even with fused timed last --\n"
+            "           thermal, or state accumulating across iterations. A harness\n"
+            "           bug: fix it before quoting any number from these shapes."
+            % (100 * max(fwd))
+        )
+    elif fwd and min(fwd) < -0.03:
+        worst = min(fwd)
+        print(
+            "\n  VERDICT: UNDER-WARMED, NOT DEGRADATION (%+.1f%%). The kernel gets\n"
+            "           FASTER over the run, so the timed window opened before\n"
+            "           steady state -- warmup is counted in iterations, so its\n"
+            "           wall-clock value shrinks with the shape and the small-M\n"
+            "           points get almost none. Those points are overstated by\n"
+            "           roughly this much; quote them from a warmed window (or\n"
+            "           rerun with --warmup-ms) before treating them as exact.\n"
+            "           Large-M conclusions are unaffected." % (100 * worst)
         )
     elif rev and max(rev) > 0.03:
         print(
@@ -454,10 +482,24 @@ def step4(outdir):
             "           (accumulated heat) rather than by idle."
         )
     else:
-        print(
-            "\n  VERDICT: NO DRIFT anywhere. Slow iterations are isolated events,\n"
-            "           not a slope."
-        )
+        # No slope, but a fat tail is a separate defect with the same cause-
+        # hunting value: it does not move the median and does move every mean.
+        slow_pct, slow_tag, slow_rank = max(
+            (t[3], t[0], t[1]) for e in drifts.values() for t in e)
+        if slow_pct > 10:
+            print(
+                "\n  VERDICT: TAILS WITHOUT DRIFT. Nothing drifts monotonically,\n"
+                "           but %.0f%% of %s r%s's iterations land >5%% over its\n"
+                "           own median -- isolated slow iterations, not heating.\n"
+                "           They leave the median alone and inflate every mean,\n"
+                "           which is exactly why the p50 columns are the ones to\n"
+                "           quote." % (slow_pct, slow_tag, slow_rank)
+            )
+        else:
+            print(
+                "\n  VERDICT: CLEAN. No drift and no fat tail anywhere; means and\n"
+                "           medians agree, so either is quotable."
+            )
 
 
 def main():

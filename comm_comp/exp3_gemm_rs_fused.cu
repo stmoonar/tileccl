@@ -47,9 +47,14 @@
 #include "cutlass/device_kernel.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
+
+// shm scratch slot for agreeing a warmup iteration count across ranks; the
+// reported results occupy 0..12 of the 16 available
+static constexpr int kWarmupSlot = 13;
 
 // ---------------------------------------------------------------------------
 // kernel types
@@ -92,6 +97,7 @@ struct Config {
   int m = 8192, n = 8192, k = 8192;
   int iters = 50;
   int warmup = 5;
+  double warmup_ms = 0;  // wall-clock warmup floor, on top of `warmup`
   int ndev = 0;
   bool verify = false;
   std::string csv;
@@ -106,6 +112,11 @@ static void usage(const char* prog) {
       "                    M %% (tile_M*world) == 0, N %% tile_N == 0 required\n"
       "  --iters N         timed iterations (default 50)\n"
       "  --warmup N        warmup iterations (default 5)\n"
+      "  --warmup-ms MS    keep warming until MS milliseconds have elapsed, on\n"
+      "                    top of --warmup. Iteration counts are the wrong unit\n"
+      "                    for warmup: 30 iterations is ~0.7 s at M=32768 but\n"
+      "                    ~7 ms at M=512, so a fixed count leaves small shapes\n"
+      "                    effectively unwarmed and overstates their cost\n"
       "  --ndev N          use only the first N GPUs (default: all)\n"
       "  --verify          check the reduce-scatter result numerically\n"
       "  --csv PATH        append machine-readable rows (rank 0 writes)\n"
@@ -161,6 +172,7 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--k") c.k = std::atoi(next().c_str());
     else if (a == "--iters") c.iters = std::atoi(next().c_str());
     else if (a == "--warmup") c.warmup = std::atoi(next().c_str());
+    else if (a == "--warmup-ms") c.warmup_ms = std::atof(next().c_str());
     else if (a == "--ndev") c.ndev = std::atoi(next().c_str());
     else if (a == "--verify") c.verify = true;
     else if (a == "--csv") c.csv = next();
@@ -276,6 +288,28 @@ static Stats time_iters(const Config& cfg, mproc::MultiProc& mp,
   for (int i = 0; i < cfg.warmup; ++i) {
     mproc::barrier_all_on_stream(sync, mp.rank, mp.world, stream);
     launch();
+  }
+  if (cfg.warmup_ms > 0) {
+    // Every rank must run the SAME number of warmup iterations: they
+    // synchronise on-stream inside each one, so a rank that stopped early on
+    // its own clock would hang the rest. Time one iteration, then agree on
+    // rank 0's figure via shm before looping.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto t0 = std::chrono::steady_clock::now();
+    mproc::barrier_all_on_stream(sync, mp.rank, mp.world, stream);
+    launch();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    mp.shm->results[mp.rank][kWarmupSlot] =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+    mp.barrier();
+    const double ref = mp.shm->results[0][kWarmupSlot];
+    const int extra = ref > 0 ? (int)(cfg.warmup_ms / ref) : 0;
+    mp.barrier();
+    for (int i = 0; i < extra; ++i) {
+      mproc::barrier_all_on_stream(sync, mp.rank, mp.world, stream);
+      launch();
+    }
   }
   for (int i = 0; i < cfg.iters; ++i) {
     mproc::barrier_all_on_stream(sync, mp.rank, mp.world, stream);
@@ -625,8 +659,8 @@ int main(int argc, char** argv) {
         "comm abs  = fused-ctrl in us. Compare THIS across shapes -- comm_sd's\n"
         "            denominator moves with K, so ratios are not comparable\n"
         "            once K changes.\n"
-        "timing order: %s (%d iters, %d warmup)\n\n",
-        cfg.order.c_str(), cfg.iters, cfg.warmup);
+        "timing order: %s (%d iters, %d warmup + %.0f ms)\n\n",
+        cfg.order.c_str(), cfg.iters, cfg.warmup, cfg.warmup_ms);
 
     std::printf(
         "struct = ctrl/base: cost of the kernel restructuring alone (static\n"

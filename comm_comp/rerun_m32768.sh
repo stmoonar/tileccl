@@ -73,13 +73,18 @@ MANIFEST="$OUT/manifest.txt"
 log() { echo "$@" | tee -a "$MANIFEST"; }
 
 if [ "$QUICK" = "1" ]; then
-  ITERS=40; WARMUP=5
+  ITERS=40; WARMUP=5; WARMUP_MS=50
   MSWEEP="512 8192 32768"
 else
   # 300 iters x 3 variants x ~8 ms = ~7 s per point; there is no reason to
   # economise here, and the 20260811 run's 50 iters put only ~2-3 samples in
   # the tail that the whole question is about.
   ITERS=300; WARMUP=30
+  # 30 iterations is ~0.7 s at M=32768 but ~7 ms at M=512, and the 20260812
+  # full sweep showed the small-M points still speeding up through the timed
+  # window because of it (fused drifted -4.8% at M=512, -4.5% at M=1024, ~0
+  # from M=2048 up). A wall-clock floor warms every shape equally.
+  WARMUP_MS=500
   # M % (tile_M * world) == 0 -> every M must be a multiple of 512.
   # m=8192 is included even though the 20260811 sweep took it from a separate
   # default run, so that one file holds the whole curve at one calibre.
@@ -142,11 +147,11 @@ make -j4 exp3_gemm_rs_fused > "$OUT/build.log" 2>&1 || {
 # ---------------------------------------------------------------------------
 run_point() {
   local tag=$1 m=$2 n=$3 k=$4 order=$5 csv=$6
-  log ">> $tag: ${m}x${n}x${k} order=$order iters=$ITERS"
+  log ">> $tag: ${m}x${n}x${k} order=$order iters=$ITERS warmup=${WARMUP}+${WARMUP_MS}ms"
   local t0=$SECONDS
   timeout --signal=INT --kill-after=30 900 \
     ./exp3_gemm_rs_fused --m "$m" --n "$n" --k "$k" \
-      --iters "$ITERS" --warmup "$WARMUP" --verify \
+      --iters "$ITERS" --warmup "$WARMUP" --warmup-ms "$WARMUP_MS" --verify \
       --order "$order" \
       --dump-iters "$OUT/iters_${tag}" \
       --csv "$OUT/${csv}" > "$OUT/${tag}.log" 2>&1
