@@ -42,6 +42,11 @@ set -u
 cd "$(dirname "$0")"
 
 QUICK=${QUICK:-0}
+# The whole point of this rerun is comparability with the 20260811 M-sweep,
+# which ran at 1830 MHz (env.txt: current 1830, max 1980). A different lock
+# would make every absolute us in step 2 incomparable with the numbers it is
+# supposed to explain, so the pre-check below insists on this exact value.
+REF_CLOCK=${REF_CLOCK:-1830}
 STAMP=$(date +%Y%m%d_%H%M%S)
 OUT=rerun_${STAMP}
 mkdir -p "$OUT"
@@ -72,19 +77,29 @@ log "== rerun_m32768 $STAMP (QUICK=$QUICK ITERS=$ITERS WARMUP=$WARMUP) =="
       --format=csv 2>&1
 } > "$OUT/env.txt" 2>&1
 
-ids=""
-[ -n "${CUDA_VISIBLE_DEVICES:-}" ] && ids="-i $CUDA_VISIBLE_DEVICES"
-bad=0
+devs=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+bad=0 clock_bad=0
 while IFS=',' read -r idx util mem sm smmax; do
   idx=${idx// /}; util=${util// /}; mem=${mem// /}; sm=${sm// /}; smmax=${smmax// /}
   case "$util$mem$sm" in *[!0-9]*) continue ;; esac
-  [ "$util" -gt 5 ]    && { log "!! GPU $idx: utilization ${util}%"; bad=1; }
-  [ "$mem" -gt 2048 ]  && { log "!! GPU $idx: ${mem} MiB held by other processes"; bad=1; }
-  [ "$sm" -lt 1000 ]   && { log "!! GPU $idx: SM clock ${sm} MHz (max ${smmax}) -- UNLOCKED;" \
-                                "run: sudo nvidia-smi -lgc <freq>"; bad=1; }
-done < <(nvidia-smi $ids \
+  [ "$util" -gt 5 ]   && { log "!! GPU $idx: utilization ${util}%"; bad=1; }
+  [ "$mem" -gt 2048 ] && { log "!! GPU $idx: ${mem} MiB held by other processes"; bad=1; }
+  if [ "$sm" -lt 1000 ]; then
+    log "!! GPU $idx: SM clock ${sm} MHz (max ${smmax}) -- UNLOCKED"
+    bad=1 clock_bad=1
+  elif [ "$sm" -ne "$REF_CLOCK" ]; then
+    log "!! GPU $idx: SM clock ${sm} MHz, but the 20260811 reference run used" \
+        "${REF_CLOCK} MHz -- absolute us would not be comparable"
+    bad=1 clock_bad=1
+  fi
+done < <(nvidia-smi -i "$devs" \
     --query-gpu=index,utilization.gpu,memory.used,clocks.sm,clocks.max.sm \
     --format=csv,noheader,nounits 2>/dev/null)
+if [ "$clock_bad" = 1 ]; then
+  log "   fix with:  nvidia-smi -lgc $REF_CLOCK -i $devs"
+  log "   (this script only RECORDS clocks, it never changes them; override the"
+  log "    target with REF_CLOCK=<freq> if you deliberately want another lock)"
+fi
 if [ "$bad" = 1 ]; then
   if [ "${FORCE:-0}" = 1 ]; then
     log "!! pre-check FAILED but FORCE=1 -- results are dirty, do not compare"

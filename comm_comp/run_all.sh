@@ -9,7 +9,7 @@
 #
 # Notes:
 #   * lock clocks first or the numbers are noisy:
-#       sudo nvidia-smi -lgc <freq> -i 0,1,2,3
+#       nvidia-smi -lgc <freq> -i 0,1,2,3
 #     (the script only RECORDS clocks, it never changes them)
 #   * the pre-check below refuses to run if any target GPU is busy, has
 #     foreign allocations, or looks unlocked -- a benchmark on a shared box
@@ -72,7 +72,7 @@ while IFS=',' read -r idx util mem sm smmax; do
   fi
   if [ "$sm" -lt 1000 ]; then
     log "!! GPU $idx: SM clock ${sm} MHz (max ${smmax}) -- looks UNLOCKED;" \
-        "run: sudo nvidia-smi -lgc <freq>"; bad=1
+        "run: nvidia-smi -lgc <freq> -i ${CUDA_VISIBLE_DEVICES:-0,1,2,3}"; bad=1
   fi
 done < <(nvidia-smi $ids \
     --query-gpu=index,utilization.gpu,memory.used,clocks.sm,clocks.max.sm \
