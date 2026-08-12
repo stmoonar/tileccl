@@ -20,11 +20,11 @@ from matplotlib.ticker import FixedLocator, NullFormatter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RES = os.path.join(HERE, "comm_comp", "results_20260811_065005")
-# The 20260812 rerun re-measured M=16384/32768 with 300 iterations and 30
+# The 20260812 rerun re-measured the whole sweep with 300 iterations and 30
 # warmup (this run used 50/5) and did not reproduce the M=32768 upturn; the
-# right panel overlays it so the corrected points sit next to the originals.
+# right panel overlays it so the corrected curve sits next to the original.
 RERUN = os.path.join(HERE, "..", "benchmark_4xH800_20260812", "comm_comp",
-                     "rerun_20260812_032525", "step1_stats.csv")
+                     "rerun_20260812_065147", "full_msweep.csv")
 OUT = os.path.join(HERE, "figs")
 
 TEAL, COPPER, SLATE, RED, GREY = "#0E6B67", "#B4560F", "#5B5E8D", "#A83232", "#8A938F"
@@ -112,7 +112,7 @@ def fig_msweep():
         rms = sorted({int(r["m"]) for r in rr})
         rcomm = [mean([float(r["comm_sd_p50"]) for r in rr
                        if int(r["m"]) == m]) for m in rms]
-        axr.plot(rms, rcomm, "D", ls=":", color=RED, ms=5, lw=1.6, zorder=4,
+        axr.plot(rms, rcomm, "D", ls=":", color=RED, ms=4, lw=1.6, zorder=4,
                  label="comm, 20260812 rerun (p50, 300 iters)")
 
     axr.annotate("latency-bound:\npull only 26 GB/s", (512, 2.19),
@@ -120,8 +120,8 @@ def fig_msweep():
                  color=TEAL)
     axr.text(2500, 1.62, "comm plateau 1.09-1.15\n(production-limited, ~54 GB/s)",
              fontsize=7.5, color=TEAL)
-    axr.annotate("rerun: 1.099, no uptick", (32768, 1.17),
-                 textcoords="offset points", xytext=(-8, 24),
+    axr.annotate("rerun: 1.101, no uptick\n(rest of the curve reproduces)",
+                 (32768, 1.17), textcoords="offset points", xytext=(-8, 26),
                  ha="right", fontsize=7.5, color=RED,
                  arrowprops=dict(arrowstyle="->", color=RED, lw=0.9,
                                  shrinkA=0, shrinkB=3))

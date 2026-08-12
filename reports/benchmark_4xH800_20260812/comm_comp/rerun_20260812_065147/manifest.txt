@@ -1,0 +1,19 @@
+== rerun_m32768 20260812_065147 (QUICK=0 ITERS=300 WARMUP=30) ==
+-- building (make -j4) --
+-- full M-sweep at 300 iters / 30 warmup (K=8192) --
+   diagnostic steps 1-3 skipped; M=16384/32768 here supersede step 1
+>> full_m512: 512x8192x8192 order=base,ctrl,fused iters=300
+   full_m512 rc=0 dur=3s
+>> full_m1024: 1024x8192x8192 order=base,ctrl,fused iters=300
+   full_m1024 rc=0 dur=4s
+>> full_m2048: 2048x8192x8192 order=base,ctrl,fused iters=300
+   full_m2048 rc=0 dur=7s
+>> full_m4096: 4096x8192x8192 order=base,ctrl,fused iters=300
+   full_m4096 rc=0 dur=5s
+>> full_m8192: 8192x8192x8192 order=base,ctrl,fused iters=300
+   full_m8192 rc=0 dur=5s
+>> full_m16384: 16384x8192x8192 order=base,ctrl,fused iters=300
+   full_m16384 rc=0 dur=8s
+>> full_m32768: 32768x8192x8192 order=base,ctrl,fused iters=300
+   full_m32768 rc=0 dur=11s
+-- done; analysing --
