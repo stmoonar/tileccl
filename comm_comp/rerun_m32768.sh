@@ -3,6 +3,7 @@
 # reports/benchmark_4xH800_20260811/ANALYSIS_MSWEEP_4xH800.md §1.
 #
 #   cd comm_comp && ./rerun_m32768.sh
+#   ./rerun_m32768.sh --full       # recalibrate the whole M-sweep instead
 #   QUICK=1 ./rerun_m32768.sh      # fewer iters, step 1 only (smoke test)
 #   FORCE=1 ./rerun_m32768.sh      # skip the environment pre-check abort
 #
@@ -36,10 +37,27 @@
 #           ramp-up and struct_sd=ctrl/base is pushed under 1. Reversed order
 #           prices that.
 #
+# --full instead runs the whole M-sweep (M=512..32768, K=8192) at this
+# script's calibre and skips the three diagnostic steps. The 20260811 sweep
+# was measured at 50 iters / 5 warmup, which is what produced the phantom
+# M=32768 upturn; its small-M points were never remeasured, so their exact
+# values are not quotable even though the effects there (2.19x at m=512) are
+# far larger than the run-to-run spread. This produces one internally
+# consistent sweep to replace them. Costs about a minute.
+#
 # Analyse with:  python3 analyze_rerun.py <results dir>
 
 set -u
 cd "$(dirname "$0")"
+
+FULL=0
+for a in "$@"; do
+  case "$a" in
+    --full) FULL=1 ;;
+    -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $a (try --help)" >&2; exit 1 ;;
+  esac
+done
 
 QUICK=${QUICK:-0}
 # The whole point of this rerun is comparability with the 20260811 M-sweep,
@@ -56,11 +74,16 @@ log() { echo "$@" | tee -a "$MANIFEST"; }
 
 if [ "$QUICK" = "1" ]; then
   ITERS=40; WARMUP=5
+  MSWEEP="512 8192 32768"
 else
   # 300 iters x 3 variants x ~8 ms = ~7 s per point; there is no reason to
   # economise here, and the 20260811 run's 50 iters put only ~2-3 samples in
   # the tail that the whole question is about.
   ITERS=300; WARMUP=30
+  # M % (tile_M * world) == 0 -> every M must be a multiple of 512.
+  # m=8192 is included even though the 20260811 sweep took it from a separate
+  # default run, so that one file holds the whole curve at one calibre.
+  MSWEEP="512 1024 2048 4096 8192 16384 32768"
 fi
 
 # ---------------------------------------------------------------------------
@@ -133,6 +156,28 @@ run_point() {
   pkill -KILL -f exp3_gemm_rs_fused 2>/dev/null; sleep 1
   true
 }
+
+if [ "$FULL" = 1 ]; then
+  # -------------------------------------------------------------------------
+  # --full: one internally consistent M-sweep, no diagnostic steps
+  # -------------------------------------------------------------------------
+  log "-- full M-sweep at ${ITERS} iters / ${WARMUP} warmup (K=8192) --"
+  log "   diagnostic steps 1-3 skipped; M=16384/32768 here supersede step 1"
+  for m in $MSWEEP; do
+    run_point "full_m${m}" "$m" 8192 8192 base,ctrl,fused full_msweep.csv
+  done
+  nvidia-smi --query-gpu=index,clocks.sm,clocks_event_reasons.active \
+      --format=csv > "$OUT/clocks_after.txt" 2>&1
+  log "-- done; analysing --"
+  python3 analyze_rerun.py "$OUT" 2>&1 | tee -a "$OUT/analysis.txt"
+  if command -v zip >/dev/null 2>&1; then
+    zip -qr "${OUT}.zip" "$OUT" && log "packed: comm_comp/${OUT}.zip"
+  else
+    tar czf "${OUT}.tar.gz" "$OUT" && log "packed: comm_comp/${OUT}.tar.gz"
+  fi
+  log "== all done =="
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # step 1: shift or tail? (the two shapes bracketing the upturn)

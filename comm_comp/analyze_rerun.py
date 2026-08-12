@@ -3,9 +3,14 @@
 
   python3 analyze_rerun.py rerun_20260812_101500
 
-Reads step1_stats.csv / step2_decouple.csv / step3_order.csv plus the
-iters_*.rank<N>.csv per-iteration dumps, and prints the four verdicts the
-rerun was designed to produce:
+Reads full_msweep.csv (from --full) and/or step1_stats.csv /
+step2_decouple.csv / step3_order.csv, plus the iters_*.rank<N>.csv
+per-iteration dumps.
+
+With --full it prints the M-sweep at one calibre: comm/struct/total per M plus
+the per-tile communication residual, which is what says whether the plateau is
+structural. Otherwise it prints the four verdicts the diagnostic rerun was
+designed to produce:
 
   1. shift or tail        -- does comm_sd rise on p50s, or only on means?
   2. tiles or duration    -- which one does the absolute comm cost track?
@@ -109,6 +114,59 @@ def find(shapes, m, k, order=None):
         if s["m"] == m and s["k"] == k and (order is None or s["order"] == order):
             return s
     return None
+
+
+# ---------------------------------------------------------------------------
+# --full: the whole M-sweep at one calibre
+# ---------------------------------------------------------------------------
+
+
+def msweep(outdir):
+    shapes = by_shape(read_rows(os.path.join(outdir, "full_msweep.csv")))
+    if not shapes:
+        return False
+    print("=" * 78)
+    print("M-SWEEP  K=8192, one calibre end to end (supersedes the 50-iter run)")
+    print("=" * 78)
+    print(
+        "%7s %6s | %9s %9s | %7s %7s %7s | %8s %8s"
+        % ("M", "tiles", "ctrl us", "fused us", "struct", "comm", "total",
+           "C p50 us", "ns/tile")
+    )
+    ordered = sorted(shapes, key=lambda s: s["m"])
+    for s in ordered:
+        print(
+            "%7d %6d | %9.1f %9.1f | %7.3f %7.3f %7.3f | %8.1f %8.1f"
+            % (s["m"], s["tiles"], s["ctrl"], s["fused"], s["struct"],
+               s["comm_p50"], s["total"], s["c_p50"],
+               1000.0 * s["c_p50"] / s["tiles"])
+        )
+    best = min(ordered, key=lambda s: s["total"])
+    print(
+        "\n  comm (p50) minimum %.3f at M=%d; total minimum %.3f at M=%d"
+        % (min(s["comm_p50"] for s in ordered),
+           min(ordered, key=lambda s: s["comm_p50"])["m"], best["total"],
+           best["m"])
+    )
+    # ns/tile falls while the fixed per-launch cost is still being amortised
+    # and levels off once the tax is purely per-tile. Test the largest three
+    # shapes: if it has levelled there, comm_sd's plateau is structural (C and
+    # ctrl both scale with tile count), not a coincidence of two points.
+    tail = ordered[-3:]
+    if len(tail) == 3:
+        ns = [1000.0 * s["c_p50"] / s["tiles"] for s in tail]
+        flat = max(ns) - min(ns) < 0.25 * min(ns)
+        print(
+            "  ns/tile at M=%s: %s -- %s"
+            % ("/".join(str(s["m"]) for s in tail),
+               " ".join("%.0f" % x for x in ns),
+               "levelled off, so the comm_sd plateau is structural"
+               if flat else
+               "still falling, so the plateau is not established yet -- the"
+               " fixed per-launch cost is still being amortised")
+        )
+    print()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +464,7 @@ def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     outdir = sys.argv[1]
+    msweep(outdir)
     got = step1(outdir)
     s1, s1_verdict = got if got else (None, None)
     step2(outdir, s1, s1_verdict)
