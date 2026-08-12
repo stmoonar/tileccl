@@ -56,16 +56,11 @@ def main():
     ax.plot(mib, tflops, "o-", color=TEAL, ms=3.5, lw=1.6, zorder=3,
             clip_on=False)
 
-    ax.axhline(ROOFLINE, color=GREY, lw=1, ls="--", zorder=2)
-    ax.text(1.0, ROOFLINE - 14, f"GEMM roofline {ROOFLINE} TFLOP/s",
-            fontsize=7, color=GREY, va="top")
-
     best = max(ss, key=lambda s: float(by_s[s]["e2e_tflops"]))
     bx = float(by_s[best]["chunk_mib"])
     by = float(by_s[best]["e2e_tflops"])
-    ax.annotate(f"best: {bx:.0f} MiB, {by:.0f} TFLOP/s\n"
-                f"({100 * by / ROOFLINE:.0f}% of roofline)", (bx, by),
-                textcoords="offset points", xytext=(0, -24), ha="center",
+    ax.annotate(f"best: {bx:.0f} MiB, {by:.0f} TFLOP/s", (bx, by),
+                textcoords="offset points", xytext=(0, 8), ha="center",
                 fontsize=7, color=TEAL)
     ax.annotate(f"{tflops[-1]:.0f}", (mib[-1], tflops[-1]),
                 textcoords="offset points", xytext=(0, -11), ha="center",
@@ -77,7 +72,7 @@ def main():
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_xlabel("copy message size (MiB)")
 
-    ax.set_ylim(0, 700)
+    ax.set_ylim(0, 690)
     ax.set_ylabel("AG+GEMM effective TFLOP/s")
 
     # same axis, second reading: the split count S per 32 MiB shard
@@ -91,7 +86,7 @@ def main():
     top.spines["top"].set_visible(False)
 
     # shape annotation, below the plot area (keeps N, K visible)
-    ax.text(0.5, -0.30,
+    ax.text(0.5, -0.21,
             "GEMM M=N=K=8192, fp16, TP world=4\n"
             "all-gathered shard 2048$\\times$8192 = 32 MiB/rank",
             transform=ax.transAxes, ha="center", va="top", fontsize=7,
