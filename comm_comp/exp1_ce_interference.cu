@@ -520,9 +520,9 @@ int main(int argc, char** argv) {
     std::printf("--- GEMM %dx%dx%d fp16: alone %.1f us/iter (p95 %.1f), "
                 "%.1f TFLOP/s, %d iters ---\n",
                 sh.m, sh.n, sh.k, alone.mean, alone.p95, tflops_alone, iters);
-    std::printf("%-11s %-6s | %11s %9s %6s %8s | %10s %10s | %s\n", "pattern",
-                "msg", "ovl us/iter", "ovl p95", "S_c", "TFLOP/s",
-                "alone GB/s", "ovl GB/s", "note");
+    std::printf("%-11s %-6s | %9s %11s %9s %6s %8s | %10s %10s | %s\n",
+                "pattern", "msg", "paired", "ovl us/iter", "ovl p95", "S_c",
+                "TFLOP/s", "alone GB/s", "ovl GB/s", "note");
 
     for (const auto& pat : cfg.patterns) {
       for (uint64_t msg : cfg.msgs) {
@@ -532,6 +532,20 @@ int main(int argc, char** argv) {
           continue;
         }
         const CommCal cal = calibrate(legs, cfg.window_ms);
+
+        // Paired baseline, measured immediately before this pattern's overlap
+        // window. S_c is a ratio, so anything that moves the GPU between the
+        // top of the block and here lands entirely in it. That is not
+        // hypothetical: the 20260812 unified-calibre run put the opening
+        // baseline in a transient dip ~0.5 s into sustained load and reported
+        // S_c of 0.948 for `bystander` and 0.944 for `engine-only` -- patterns
+        // that cannot slow the GEMM down, let alone speed it up. Re-measuring
+        // here costs one window per pattern and makes S_c immune to anything
+        // slower than a single alone/overlap pair.
+        g.enqueue_timed(warm, iters);
+        CUDA_CHECK(cudaEventSynchronize(g.e_end));
+        const Stats alone_p = g.collect(iters);
+        const double tflops_alone_p = g.flop() / (alone_p.mean * 1e-6) / 1e12;
 
         Pump pump;
         pump.start(&legs, cal.chunk_msgs);
@@ -548,7 +562,7 @@ int main(int argc, char** argv) {
         pump.drain();
 
         const Stats ovl = g.collect(iters);
-        const double s_c = alone.mean > 0 ? ovl.mean / alone.mean : 0;
+        const double s_c = alone_p.mean > 0 ? ovl.mean / alone_p.mean : 0;
         const double tflops_ovl = g.flop() / (ovl.mean * 1e-6) / 1e12;
         const double ovl_gbps =
             wall_s > 0 ? pump.completed_bytes / wall_s / 1e9 : 0;
@@ -562,10 +576,10 @@ int main(int argc, char** argv) {
           std::snprintf(msg_str, sizeof(msg_str), "%lluK",
                         (unsigned long long)(msg >> 10));
 
-        std::printf("%-11s %-6s | %11.1f %9.1f %6.3f %8.1f | %10.2f %10.2f "
-                    "| %s\n",
-                    pat.c_str(), msg_str, ovl.mean, ovl.p95, s_c, tflops_ovl,
-                    cal.gbps, ovl_gbps, note);
+        std::printf("%-11s %-6s | %9.1f %11.1f %9.1f %6.3f %8.1f | %10.2f "
+                    "%10.2f | %s\n",
+                    pat.c_str(), msg_str, alone_p.mean, ovl.mean, ovl.p95, s_c,
+                    tflops_ovl, cal.gbps, ovl_gbps, note);
         std::fflush(stdout);
 
         if (csv)
@@ -573,17 +587,17 @@ int main(int argc, char** argv) {
                        "%s,%d,%d,%d,%llu,%zu,%.2f,%.2f,%.2f,%.2f,%.4f,%.1f,"
                        "%.1f,%.3f,%.3f,%d\n",
                        pat.c_str(), sh.m, sh.n, sh.k, (unsigned long long)msg,
-                       legs.size(), alone.mean, ovl.mean, alone.p95, ovl.p95,
-                       s_c, tflops_alone, tflops_ovl, cal.gbps, ovl_gbps,
-                       pump.gaps);
+                       legs.size(), alone_p.mean, ovl.mean, alone_p.p95,
+                       ovl.p95, s_c, tflops_alone_p, tflops_ovl, cal.gbps,
+                       ovl_gbps, pump.gaps);
         destroy_legs(legs);
       }
     }
 
-    // Paired baseline: re-measure `alone` after all patterns ran. Every S_c
-    // above is a ratio against the *opening* baseline, so environmental drift
-    // (another job landing on the box, clocks sagging) silently pollutes all
-    // of them; this makes it visible and flags the whole block.
+    // Environment diagnostic only -- each S_c above already has its own
+    // paired baseline, so this no longer gates their validity. It still says
+    // whether the box stayed put across the whole block, which is worth
+    // knowing before trusting anything else in the run.
     g.enqueue_timed(warm, iters);
     CUDA_CHECK(cudaEventSynchronize(g.e_end));
     const Stats alone2 = g.collect(iters);
@@ -592,8 +606,9 @@ int main(int argc, char** argv) {
     std::printf("baseline recheck: alone %.1f -> %.1f us/iter (drift %+.1f%%)%s\n",
                 alone.mean, alone2.mean, drift * 100.0,
                 std::fabs(drift) > 0.05
-                    ? "  [!] drift >5%: environment not quiet, every S_c "
-                      "above is unreliable"
+                    ? "  [!] drift >5%: the box moved during this block; S_c "
+                      "is paired so it survives, but treat absolute us with "
+                      "care"
                     : "");
     std::printf("\n");
     g.destroy();

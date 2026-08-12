@@ -95,6 +95,49 @@ if ! make -j4 > "$OUT/build.log" 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
+# clock / power / temperature sampler
+# ---------------------------------------------------------------------------
+# `nvidia-smi -lgc` locks the SM clock but NOT the memory clock, and it does not
+# stop the hardware from capping on power or temperature. Both would be
+# invisible in the result CSVs and would show up only as inexplicable timing
+# shifts -- which is exactly what the 20260812 unified-calibre run hit: exp1's
+# opening baseline and exp2's overlap window, both measured ~0.5-0.75 s into
+# sustained load, came out 4-8% slow while every measurement before and after
+# them was fine. Sampling at 100 ms turns that class of question into a lookup.
+SAMPLE_FIELDS="index,clocks.sm,clocks.mem,power.draw,temperature.gpu,\
+clocks_event_reasons.hw_power_brake_slowdown,clocks_event_reasons.sw_power_cap,\
+clocks_event_reasons.hw_thermal_slowdown"
+
+start_sampler() {
+  # Probe once first: a bad field name makes nvidia-smi fail, and with the
+  # loop's stderr discarded that would leave an empty trace file that looks
+  # like "nothing happened" rather than "the query was wrong".
+  if ! nvidia-smi -i "${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
+       --query-gpu="$SAMPLE_FIELDS" --format=csv,noheader,nounits \
+       > "$OUT/gpu_trace_probe.txt" 2>&1; then
+    log "!! gpu sampler DISABLED: query failed -- see gpu_trace_probe.txt"
+    SAMPLER_PID=""
+    return
+  fi
+  ( while :; do
+      printf '%s,' "$(date +%s.%N)"
+      nvidia-smi -i "${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
+        --query-gpu="$SAMPLE_FIELDS" \
+        --format=csv,noheader,nounits 2>/dev/null | tr '\n' ';'
+      printf '\n'
+      sleep 0.1
+    done ) > "$OUT/gpu_trace.csv" 2>/dev/null &
+  SAMPLER_PID=$!
+  log "-- gpu sampler started (pid $SAMPLER_PID, 100 ms) --"
+}
+
+stop_sampler() {
+  [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null
+  wait "${SAMPLER_PID:-}" 2>/dev/null
+  true
+}
+
+# ---------------------------------------------------------------------------
 # runner: run NAME TIMEOUT_S CMD...
 # ---------------------------------------------------------------------------
 run() {
@@ -105,6 +148,7 @@ run() {
     return
   fi
   log ">> $name: $* (timeout ${tmo}s)"
+  log "   $name epoch_start=$(date +%s.%N)"
   local t0=$SECONDS
   timeout --signal=INT --kill-after=30 "$tmo" "$@" > "$OUT/$name.log" 2>&1
   local rc=$?
@@ -142,6 +186,8 @@ else
   MSWEEP_V1="64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192,16384x8192x8192,32768x8192x8192"
   MSWEEP_V2="512 1024 2048 4096 8192 16384 32768"
 fi
+
+start_sampler
 
 # ---------------------------------------------------------------------------
 # exp1: CE traffic vs independent GEMM
@@ -217,6 +263,7 @@ done
 # ---------------------------------------------------------------------------
 # wrap up
 # ---------------------------------------------------------------------------
+stop_sampler
 nvidia-smi --query-gpu=index,clocks.sm,clocks_throttle_reasons.active \
     --format=csv > "$OUT/clocks_after.txt" 2>&1
 
