@@ -1,0 +1,18 @@
+== rerun_m32768 20260812_032525 (QUICK=0 ITERS=300 WARMUP=30) ==
+-- building (make -j4) --
+-- step 1: statistics (p50 + raw series) --
+>> s1_m16384: 16384x8192x8192 order=base,ctrl,fused iters=300
+   s1_m16384 rc=0 dur=7s
+>> s1_m32768: 32768x8192x8192 order=base,ctrl,fused iters=300
+   s1_m32768 rc=0 dur=11s
+-- step 2: decouple tiles vs duration (vary K) --
+>> s2_m32768_k4096: 32768x8192x4096 order=base,ctrl,fused iters=300
+   s2_m32768_k4096 rc=0 dur=8s
+>> s2_m16384_k16384: 16384x8192x16384 order=base,ctrl,fused iters=300
+   s2_m16384_k16384 rc=0 dur=14s
+-- step 3: run-order control (reverse) --
+>> s3_m32768_rev: 32768x8192x8192 order=fused,ctrl,base iters=300
+   s3_m32768_rev rc=0 dur=11s
+>> s3_m16384_rev: 16384x8192x8192 order=fused,ctrl,base iters=300
+   s3_m16384_rev rc=0 dur=8s
+-- done; analysing --

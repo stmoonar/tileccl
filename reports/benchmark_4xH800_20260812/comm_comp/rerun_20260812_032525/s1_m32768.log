@@ -1,0 +1,33 @@
+=== exp3 v2: fused GEMM+RS (flux sm90 design) vs stock GEMM ===
+world 4 (1 process per GPU, cudaIPC), 32768x8192x8192 fp16 per rank
+tile 128x256x64 cluster 1x2x1, mainloop stages: baseline 4, ctrl/fused 3 (DMA smem carveout)
+epilogue StagesC 4 StagesD 2 (builder default; flux gemm_v3_reduce_scatter forces StagesD=1)
+RS pull volume per rank: 384.0 MiB, grid 132 blocks
+
+rank |      base us  TFLOP/s |    ctrl us |     fused us  TFLOP/s | struct   comm  total | pull GB/s | verify
+   0 |       6792.0    647.5 |     6799.6 |       7443.4    590.9 |  1.001  1.095  1.096 |      54.1 | ok (rel 0.018)
+   1 |       7289.9    603.3 |     6928.5 |       7584.6    579.9 |  0.950  1.095  1.040 |      53.1 | ok (rel 0.0182)
+   2 |       7101.1    619.3 |     6947.9 |       7586.4    579.7 |  0.978  1.092  1.068 |      53.1 | ok (rel 0.0184)
+   3 |       6913.4    636.2 |     6715.4 |       7472.2    588.6 |  0.971  1.113  1.081 |      53.9 | ok (rel 0.0226)
+
+rank |   base p50   ctrl p50   fusd p50 | comm p50 comm avg comm skew | comm abs us
+   0 |     6783.0     6792.5     7447.0 |    1.096    1.095    1.071 |     643.8
+   1 |     7118.7     6946.4     7589.1 |    1.093    1.095    1.092 |     656.1
+   2 |     7026.8     6942.0     7592.4 |    1.094    1.092    1.092 |     638.5
+   3 |     6934.5     6722.3     7475.8 |    1.112    1.113    1.075 |     756.8
+comm p50  = fused_p50/ctrl_p50: tail-immune. If it stays flat while
+            comm avg rises, the rise is outlier iterations, not cost.
+comm skew = fused_mean/max_r(ctrl_mean): charges each rank only for
+            comm, not for its peers' spread (fused waits on the
+            slowest producer either way).
+comm abs  = fused-ctrl in us. Compare THIS across shapes -- comm_sd's
+            denominator moves with K, so ratios are not comparable
+            once K changes.
+timing order: base,ctrl,fused (300 iters, 30 warmup)
+
+struct = ctrl/base: cost of the kernel restructuring alone (static
+scheduler, swizzle, smem carveout; comm switched off).
+comm = fused/ctrl: cost of the communication alone (flag publishes,
+NVLink pulls, fp16 reduction, slowest-peer tail).
+worst-rank: total 1.096, comm 1.113. flux pays this to keep the
+epilogue local instead of remote-writing (v1 exp3 measures that option).

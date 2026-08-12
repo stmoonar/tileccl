@@ -1,0 +1,76 @@
+==============================================================================
+STEP 1  shift or tail?   (K=8192, comm_sd on means vs on medians)
+==============================================================================
+       M   ctrl us   fusd us | comm avg comm p50 comm skw |  C avg us  C p50 us
+   16384    3459.5    3809.6 |    1.101    1.105    1.093 |     350.1     358.0
+   32768    6847.9    7521.6 |    1.098    1.099    1.083 |     673.8     675.3
+
+  16384 -> 32768:  comm_sd(mean) -0.003,  comm_sd(p50) -0.006
+  VERDICT: MIXED (p50 rise -0.006) -- both effects present.
+
+==============================================================================
+STEP 2  does the cost track TILES or DURATION?
+==============================================================================
+        comm_sd is NOT comparable across these rows (K moves the
+        denominator). Read C = fused-ctrl, in absolute us.
+
+      M      K  tiles  pullMi   dur ms |  C avg us  C p50 us | us/ktile    us/ms
+  32768   4096   8192     384     6.25 |    2740.2    2796.7 |    341.4    447.2
+  32768   8192   8192     384     7.52 |     673.8     675.3 |     82.4     89.8
+  16384   8192   4096     192     3.81 |     350.1     358.0 |     87.4     94.0
+  16384  16384   4096     192     7.17 |     343.7     331.4 |     80.9     46.2
+
+  holding tiles+volume, halving duration: C keeps 414% of the anomaly
+  holding duration, halving tiles+volume: C keeps 49% of the anomaly
+  VERDICT: TILE/VOLUME BOUND. The cost follows the flag+fetch path,
+           not elapsed time -- a per-tile protocol cost that grows
+           superlinearly once the flag array gets long. Next: Nsight
+           on the fetch warps' system-scope polling.
+
+==============================================================================
+STEP 3  is struct_sd < 1 real, or does `base` just run first?
+==============================================================================
+       M | struct fwd struct rev |   comm fwd   comm rev
+   16384 |      0.980      0.991 |      1.105      1.091
+   32768 |      0.975      0.980 |      1.099      1.087
+
+  mean struct_sd: forward 0.977, reversed 0.985 (+0.008)
+  VERDICT: REAL. struct_sd survives order reversal, so the
+           restructured kernel genuinely is not slower (the smem
+           carveout / stage-count explanation stands).
+
+==============================================================================
+STEP 4  tail shape from the raw per-iteration series (fused only)
+==============================================================================
+tag                  rank     p50     mean      max    >5% 1st 3rd last 3rd
+s1_m16384               0  3767.6   3803.0   4095.6     7%  3747.5   3733.9
+s1_m16384               1  3772.0   3792.9   3935.3     0%  3758.8   3766.2
+s1_m16384               2  3778.6   3809.7   3981.9     1%  3767.6   3774.9
+s1_m16384               3  3795.3   3832.8   4143.4     8%  3787.6   3742.3
+s1_m32768               0  7446.0   7443.4   7675.6     0%  7435.1   7440.6
+s1_m32768               1  7589.0   7584.6   7712.7     0%  7576.9   7613.3
+s1_m32768               2  7592.4   7586.4   7730.5     0%  7583.2   7605.4
+s1_m32768               3  7475.1   7472.2   7628.0     0%  7467.3   7476.9
+s2_m16384_k16384        0  7102.7   7117.7   7372.8     0%  7057.5   7087.3
+s2_m16384_k16384        1  7193.2   7203.8   7412.2     0%  7221.2   7181.0
+s2_m16384_k16384        2  7200.8   7212.7   7459.1     0%  7224.0   7149.6
+s2_m16384_k16384        3  7141.1   7159.2   7419.4     0%  7100.6   7126.8
+s2_m32768_k4096         0  6219.6   6220.3   6356.3     0%  6212.9   6220.8
+s2_m32768_k4096         1  6331.2   6334.8   6600.9     0%  6310.2   6337.0
+s2_m32768_k4096         2  6261.7   6266.7   6393.5     0%  6257.1   6266.9
+s2_m32768_k4096         3  6189.2   6195.4   6466.0     0%  6192.0   6188.0
+s3_m16384_rev           0  3706.8   3801.2   4673.7    14%  3700.5   3799.6
+s3_m16384_rev           1  3751.2   3798.5   4388.2     9%  3746.2   3785.6
+s3_m16384_rev           2  3769.1   3812.0   4339.9     9%  3762.0   3792.1
+s3_m16384_rev           3  3707.7   3816.0   4724.8    16%  3696.7   3845.3
+s3_m32768_rev           0  7358.5   7530.2   9149.6    19%  7272.9   7494.0
+s3_m32768_rev           1  7460.8   7527.6   8638.9     8%  7338.1   7563.6
+s3_m32768_rev           2  7491.8   7553.0   8606.7     9%  7377.2   7560.1
+s3_m32768_rev           3  7336.3   7534.7   9198.7    21%  7280.1   7480.0
+
+  worst first-third -> last-third drift: +4.0%
+  VERDICT: DRIFT. The kernel gets monotonically slower over the run
+           -- thermal/power, or state accumulating across iterations
+           (flags not fully cleared). This is a harness bug to fix
+           before any m=32768 number is quotable.
+

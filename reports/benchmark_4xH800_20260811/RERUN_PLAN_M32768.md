@@ -1,5 +1,12 @@
 # 复跑方案：m=32768 comm_sd 上翘定性（4×H800）
 
+> **状态：已执行（2026-08-12）。结论 = 上翘不复现**（comm_sd 1.098，与 m=16384
+> 的 1.101 打平）。结果与分析见
+> `../benchmark_4xH800_20260812/ANALYSIS_RERUN_M32768.md`。
+> 下文保留为方案原文；判据表中实际命中的是 step 1 的"未复现"分支
+> （该分支是复跑后补进 `analyze_rerun.py` 的，原始判据表只有 TAIL/SHIFT/MIXED
+> 三档——这本身是方案的一个疏漏）。
+
 - **待决问题**：`ANALYSIS_MSWEEP_4xH800.md` §1 末尾的 ⚠ —— fused comm_sd 在
   M=16384→32768 从 1.09 回升到 1.17，且**只有 fused 出现肥尾**。
 - **代码**：`comm_comp/rerun_m32768.sh`（驱动）+ `comm_comp/analyze_rerun.py`（判读），

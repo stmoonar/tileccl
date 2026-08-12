@@ -20,6 +20,11 @@ from matplotlib.ticker import FixedLocator, NullFormatter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RES = os.path.join(HERE, "comm_comp", "results_20260811_065005")
+# The 20260812 rerun re-measured M=16384/32768 with 300 iterations and 30
+# warmup (this run used 50/5) and did not reproduce the M=32768 upturn; the
+# right panel overlays it so the corrected points sit next to the originals.
+RERUN = os.path.join(HERE, "..", "benchmark_4xH800_20260812", "comm_comp",
+                     "rerun_20260812_032525", "step1_stats.csv")
 OUT = os.path.join(HERE, "figs")
 
 TEAL, COPPER, SLATE, RED, GREY = "#0E6B67", "#B4560F", "#5B5E8D", "#A83232", "#8A938F"
@@ -101,15 +106,26 @@ def fig_msweep():
             ("struct = ctrl/base (mean)", col("struct_sd", mean), SLATE, "-")]:
         axr.plot(fms, vals, "o", ls=ls, color=color, label=label, ms=4, lw=1.8,
                  zorder=3)
+    # 20260812 rerun: same shapes, 300 iters / 30 warmup instead of 50 / 5
+    if os.path.exists(RERUN):
+        rr = rows(RERUN)
+        rms = sorted({int(r["m"]) for r in rr})
+        rcomm = [mean([float(r["comm_sd_p50"]) for r in rr
+                       if int(r["m"]) == m]) for m in rms]
+        axr.plot(rms, rcomm, "D", ls=":", color=RED, ms=5, lw=1.6, zorder=4,
+                 label="comm, 20260812 rerun (p50, 300 iters)")
+
     axr.annotate("latency-bound:\npull only 26 GB/s", (512, 2.19),
-                 textcoords="offset points", xytext=(10, -18), fontsize=7.5,
+                 textcoords="offset points", xytext=(8, -30), fontsize=7.5,
                  color=TEAL)
-    axr.text(3300, 1.42, "comm plateau 1.09-1.15\n(production-limited, ~54 GB/s)",
+    axr.text(2500, 1.62, "comm plateau 1.09-1.15\n(production-limited, ~54 GB/s)",
              fontsize=7.5, color=TEAL)
-    axr.annotate("uptick + fat tail\n(8192 tiles)", (32768, 1.17),
-                 textcoords="offset points", xytext=(-10, 14), ha="right",
-                 fontsize=7.5, color=RED)
-    axr.text(2600, 0.905, "struct: cost at 1-4 waves, gain at >=4096",
+    axr.annotate("rerun: 1.099, no uptick", (32768, 1.17),
+                 textcoords="offset points", xytext=(-8, 24),
+                 ha="right", fontsize=7.5, color=RED,
+                 arrowprops=dict(arrowstyle="->", color=RED, lw=0.9,
+                                 shrinkA=0, shrinkB=3))
+    axr.text(2600, 0.895, "struct: cost at 1-4 waves, ~free at >=4096",
              fontsize=7.5, color=SLATE)
     axr.axhline(1.0, color=GREY, lw=1, ls="--", zorder=2)
     axr.set_yscale("log")
@@ -119,14 +135,16 @@ def fig_msweep():
     axr.yaxis.set_minor_formatter(NullFormatter())
     axr.set_title("exp3 v2: fused GEMM+RS vs M (K=8192, 4-rank)")
 
-    for ax, ticks in ((axl, ms), (axr, fms)):
+    # right panel gained a fourth series, so its legend no longer fits the
+    # top-left corner without sitting on the m=512 annotation
+    for ax, ticks, loc in ((axl, ms, "upper right"), (axr, fms, "upper right")):
         ax.set_xscale("log", base=2)
         ax.xaxis.set_major_locator(FixedLocator(ticks))
         ax.xaxis.set_major_formatter(
             lambda x, _: f"{int(x/1024)}K" if x >= 1024 else f"{int(x)}")
         ax.xaxis.set_minor_formatter(NullFormatter())
         ax.set_xlabel("M")
-        ax.legend(frameon=False, fontsize=8)
+        ax.legend(frameon=False, fontsize=7.5, loc=loc)
 
     os.makedirs(OUT, exist_ok=True)
     fig.savefig(os.path.join(OUT, "fig7_msweep.png"))
