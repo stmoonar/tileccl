@@ -27,6 +27,8 @@ Everything needs the submodules first: `git submodule update --init`
 - `tests/` and `signalling/`: `make` — default `ARCH=sm_120a`; override with
   `make ARCH=sm_90a` for Hopper or `ARCH=sm_120` if the toolkit rejects the
   family-specific arch.
+- `l2_peer_cache/`: `make` — default `ARCH=sm_90` (it targets the NVLink box);
+  builds the same source twice, the second time with `-Xptxas -dlcm=cg`.
 
 Each `.cu` is a standalone binary with `--help`-style usage in its header
 comment; single-process multi-GPU via `cudaDeviceEnablePeerAccess` + UVA (no
@@ -76,6 +78,11 @@ bundles with different clocks. The "1980 MHz" printed by binaries is
     ctrl group is what makes attribution possible; keep it when extending.
 - `signalling/` — push vs pull completion-signalling latency (single-process
   CUDA translation of NVSHMEM primitives, MoK-style fan-in).
+- `l2_peer_cache/` — is peer memory cached in the *requester's* L2? (No: the
+  L2 is memory-side.) Bandwidth + chase-latency sweeps across the L2 capacity
+  and a direct NVLink byte count, all with a `local` control whose step is
+  what proves the instrument works; `run_all.sh` reduces it to a `verdict.txt`
+  that says INCONCLUSIVE when the control does not behave.
 - `tests/` — P2P microbench for the local sm_120 pair (CE vs TMA vs register
   paths, interference matrices, ParallelKittens Fig.2/3 reproduction).
 
