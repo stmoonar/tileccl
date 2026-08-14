@@ -209,6 +209,44 @@ for build in ca cg; do
       --csv "$OUT/$build"
 done
 
+# ---------------------------------------------------------------------------
+# the PUSH side: does a store into peer memory touch the SENDER's L2?
+# ---------------------------------------------------------------------------
+# Only the L1-bypassed build runs here. -dlcm is ptxas's default cache modifier
+# for LDG; it does not touch stores, which have been write-through in L1 since
+# Volta. A second build would be a duplicate, not a control.
+run "probe_st" 1800 ./peer_l2_probe_nol1 $COMMON \
+    --dir write --modes bw,wire \
+    --total "$TOTAL" --reps "$REPS" \
+    --wire-sizes "$WIRE_SIZES" --wire-total "$WIRE_TOTAL" \
+    --csv "$OUT/st"
+
+# ---------------------------------------------------------------------------
+# the TMA path: the same questions for cp.async.bulk
+# ---------------------------------------------------------------------------
+# This is the engine exp3_gemm_rs_fused actually uses to pull peer tiles, so a
+# result measured on ld.global does not automatically transfer to it.
+#
+# Both builds again -- not because -dlcm should change a bulk copy (it should
+# not, it is an LDG modifier), but because if these two disagree then the model
+# of what the TMA path does is wrong, and that is much better discovered here
+# than in the analysis. Reads first, then the smem->peer push.
+for build in ca cg; do
+  bin=./peer_l2_probe
+  [ "$build" = cg ] && bin=./peer_l2_probe_nol1
+  run "probe_tma_$build" 1800 "$bin" $COMMON \
+      --via tma --modes bw,wire \
+      --total "$TOTAL" --reps "$REPS" \
+      --wire-sizes "$WIRE_SIZES" --wire-total "$WIRE_TOTAL" \
+      --csv "$OUT/tma_$build"
+done
+
+run "probe_tmast" 1800 ./peer_l2_probe $COMMON \
+    --via tma --dir write --modes bw,wire \
+    --total "$TOTAL" --reps "$REPS" \
+    --wire-sizes "$WIRE_SIZES" --wire-total "$WIRE_TOTAL" \
+    --csv "$OUT/tmast"
+
 # A second peer-only wire point with a working set far larger than L2. Nobody
 # expects caching there, so its RX/asked is the calibration for the small-buffer
 # number: if the 1 MB point and the 512 MB point both come back at 1.00, the
@@ -224,9 +262,17 @@ run "wire_bigbuf" 900 ./peer_l2_probe_nol1 $COMMON \
 # NCU's "peer traffic" metrics only cover PCIe-attached GPUs, so NVLink needs
 # the Nvlink section explicitly. --kernel-name filters first, then skip/count,
 # so this profiles the single timed launch and not the fill or warmup kernels.
-NCU_BASE="--target-processes all --clock-control none --kernel-name stream_read_kernel --launch-skip 1 --launch-count 1"
+NCU_COMMON="--target-processes all --clock-control none --launch-skip 1 --launch-count 1"
+NCU_BASE="$NCU_COMMON --kernel-name stream_read_kernel"
 NCU_METRICS="dram__bytes_read.sum,lts__t_sectors.sum,lts__t_sectors_lookup_hit.sum,lts__t_sectors_lookup_miss.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum"
 NCU_METRICS_MIN="dram__bytes_read.sum,lts__t_sectors.sum"
+# Store side: DRAM writes and the L2 write sectors on the SENDER. l1tex's store
+# counter is the denominator (what the SMs issued), exactly as the load counter
+# is for the read case.
+NCU_METRICS_ST="dram__bytes_write.sum,lts__t_sectors.sum,lts__t_sectors_op_write.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum"
+# TMA side: bulk copies do not go through the LSU, so there is no l1tex
+# denominator here -- the Nvlink section and --total are the denominators.
+NCU_METRICS_TMA="dram__bytes_read.sum,dram__bytes_write.sum,lts__t_sectors.sum,lts__t_sectors_lookup_hit.sum,lts__t_sectors_lookup_miss.sum"
 
 if [ "${NO_NCU:-0}" = 1 ]; then
   log "-- ncu skipped (NO_NCU=1) --"
@@ -260,6 +306,33 @@ else
   log "   ncu note: for target=local, dram__bytes_read.sum ~= 8 MiB (one cold"
   log "   pass; the other $NCU_TOTAL of reads were L2 hits). For target=peer it"
   log "   should be ~0 while the Nvlink section shows ~$NCU_TOTAL received."
+
+  # Same counter cross-check for the three paths the ld/st read sweep does not
+  # cover. Each row is (tag, kernel, extra probe args, metric set).
+  #   st      -- ld/st push:  is the SENDER's L2 touched by a peer store?
+  #   tmald   -- cp.async.bulk pull into smem (what exp3_gemm_rs_fused does)
+  #   tmast   -- cp.async.bulk push out of smem (what p2p_ce_vs_tma measures)
+  NCU_EXTRA="
+st|stream_write_kernel|--dir write|$NCU_METRICS_ST
+tmald|tma_stream_read_kernel|--via tma|$NCU_METRICS_TMA
+tmast|tma_stream_write_kernel|--via tma --dir write|$NCU_METRICS_TMA
+"
+  echo "$NCU_EXTRA" | while IFS='|' read -r tag kern extra metrics; do
+    [ -z "$tag" ] && continue
+    for tgt in peer local; do
+      run "ncu_nvlink_${tag}_$tgt" 900 ncu $NCU_COMMON --kernel-name "$kern" \
+          --section Nvlink --log-file "$OUT/ncu_nvlink_${tag}_$tgt.txt" \
+          ./peer_l2_probe_nol1 $COMMON $extra --modes once --targets "$tgt" \
+          --sizes 8M --total "$NCU_TOTAL" --no-verify --no-counters
+      run "ncu_metrics_${tag}_$tgt" 900 ncu $NCU_COMMON --kernel-name "$kern" \
+          --metrics "$metrics" --log-file "$OUT/ncu_metrics_${tag}_$tgt.txt" \
+          ./peer_l2_probe_nol1 $COMMON $extra --modes once --targets "$tgt" \
+          --sizes 8M --total "$NCU_TOTAL" --no-verify --no-counters
+    done
+  done
+  log "   ncu note: the st/tmald/tmast rows read the same way -- local moves"
+  log "   real dram/lts traffic, peer moves ~none of it locally and the whole"
+  log "   payload shows up in the Nvlink section instead."
 fi
 
 stop_sampler; trap - EXIT
@@ -272,6 +345,44 @@ nvidia-smi --query-gpu=index,clocks.sm,clocks_throttle_reasons.active \
 # ---------------------------------------------------------------------------
 # Reduces the CSVs to the three numbers the conclusion rests on, and refuses to
 # conclude anything if the control did not behave.
+
+# Same reduction for the paths added later (push, TMA pull, TMA push). Each one
+# carries its own `local` control, so each can be read on its own.
+report_path() {   # $1 = human label, $2 = csv prefix
+  [ -s "$2_bw.csv" ] || return 0
+  echo "---- $1 ----"
+  awk -F, '
+    $1=="build" {next}
+    {t=$2; bytes=$3+0; frac=$4+0; g=$11+0
+     if (frac<=0.25 && bytes>inb[t]) {inb[t]=bytes; ing[t]=g}
+     if (frac>=2 && (outb[t]==0 || bytes<outb[t])) {outb[t]=bytes; outg[t]=g}}
+    END{
+      split("local peer", ord, " ")
+      for (i=1; i<=2; i++) { t=ord[i]; if (outg[t]>0)
+        printf "  bw  %-5s  in-L2 %8.0f GB/s   out-of-L2 %8.0f GB/s   knee %5.2fx\n",
+               t, ing[t], outg[t], ing[t]/outg[t] }
+    }' "$2_bw.csv"
+  # The knee above is deliberately read at >=0.25x L2, so it is blind to any
+  # per-SM cache. This line is not: it compares the smallest working set of the
+  # sweep against one well past L2 on the peer curve.
+  awk -F, '
+    $1=="build" || $2!="peer" {next}
+    (sb==0 || $3+0<sb) {sb=$3+0; sg=$11+0}
+    $4+0>=2 && (bb==0 || $3+0<bb) {bb=$3+0; bg=$11+0}
+    END{
+      if (sg<=0 || bg<=0) exit
+      # awk does not allow a newline inside a ?: -- keep the verdict on one line
+      m = "[flat: nothing cached per-SM]"
+      if (sg > 1.5*bg) m = "[a per-SM cache absorbs peer traffic here]"
+      printf "  L1? peer %.0fK vs %.0fM = %5.2fx  %s\n", sb/1024, bb/1048576, sg/bg, m
+    }' "$2_bw.csv"
+  [ -s "$2_wire.csv" ] && awk -F, '
+    $1=="build" {next}
+    $15==1 {printf "  wire %-5s %8.1f MiB -> near/asked %6.3f, far/asked %6.3f\n",
+                   $2, $3/1048576, $11, $12}
+    $15==0 {print "  wire " $2 ": NVLink counters unavailable"}' "$2_wire.csv"
+  echo
+}
 {
   echo "=================================================================="
   echo " VERDICT: is peer memory cached in the REQUESTER's L2?"
@@ -323,6 +434,39 @@ nvidia-smi --query-gpu=index,clocks.sm,clocks_throttle_reasons.active \
                $3/1048576, $11}' "$OUT/bigbuf_wire.csv"
     echo
   fi
+
+  # The L1 result, stated rather than left implicit in the CSVs. Every number
+  # above is read at >= 0.25x L2 so that L1 cannot contaminate the L2 verdict --
+  # which also means none of them can see L1. This one can: the same small
+  # working set, default build vs -dlcm=cg.
+  if [ -s "$OUT/ca_wire.csv" ] && [ -s "$OUT/cg_wire.csv" ]; then
+    awk -F, -v cgf="$OUT/cg_wire.csv" '
+      $1=="build" || $2!="peer" || $15+0!=1 {next}
+      (small==0 || $3+0 < small) {small=$3+0; ca=$11+0}
+      END{
+        while ((getline line < cgf) > 0) {
+          split(line, f, ",")
+          if (f[1]=="build" || f[2]!="peer" || f[15]+0!=1) continue
+          if (f[3]+0 == small) cgv = f[11]+0
+        }
+        if (small>0 && cgv>0)
+          printf "L1       peer wire RX/asked at %.0f MiB: default %.3f vs -dlcm=cg %.3f  %s\n\n",
+                 small/1048576, ca, cgv,
+                 (ca < 0.5*cgv) ? "[L1 DOES cache peer lines]" : "[no L1 effect]"
+      }' "$OUT/ca_wire.csv"
+  fi
+
+  # ------------------------------------------------------------------
+  # the paths the read sweep does not cover
+  # ------------------------------------------------------------------
+  # Read exactly like the sections above: `local` must step (the instrument
+  # works), `peer` must not (nothing cached on this side), and the link must
+  # carry every byte. The extra `L1?` line is what says whether the per-SM
+  # caching seen on ld.global also happens on this path.
+  report_path "PUSH, ld/st: st.global into peer memory" "$OUT/st"
+  report_path "PULL, TMA: cp.async.bulk peer gmem -> smem (default L1)" "$OUT/tma_ca"
+  report_path "PULL, TMA: cp.async.bulk peer gmem -> smem (-dlcm=cg)" "$OUT/tma_cg"
+  report_path "PUSH, TMA: cp.async.bulk smem -> peer gmem" "$OUT/tmast"
 
   # The decision, from the L1-bypassed build (the one that isolates L2).
   awk -F, -v wire="$OUT/cg_wire.csv" '

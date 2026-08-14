@@ -64,6 +64,41 @@ PCIe P2P，结论方向相同，数值不同。
 不是停在链路延迟（10³ ns 量级）。带宽平坦有可能是链路饱和造成的错觉，延迟平坦
 不会。
 
+### 两个正交的轴：`--via` 和 `--dir`
+
+上面三个 mode 测的是「用 `ld.global` **读**远端」。这只是四个格子里的一个，而且
+不是本仓库最关心的那个——`exp3_gemm_rs_fused` 拉远端 tile 用的是 **TMA**，
+`tests/p2p_ce_vs_tma` 推远端用的是 **store**。所以 `bw` / `wire` / `once` 三个
+mode 都能沿两个轴切换（`lat` 不能：依赖链 chase 没有 TMA 或 store 的对应物）：
+
+| | `--dir read`（pull） | `--dir write`（push） |
+|---|---|---|
+| `--via ldst` | `ld.global`，默认组合 | `st.global` 打进对端 VA |
+| `--via tma` | `cp.async.bulk` peer gmem → smem（**exp3 走的就是这条**） | `cp.async.bulk` smem → peer gmem |
+
+四个格子问的是同一个问题：**发起这次访问的那张卡，它自己的 L2 有没有参与？**
+判读方式完全一样——`local` 必须有台阶（仪器有效），`peer` 必须平，链路必须扛走
+每一个字节。
+
+两个轴各自带来一点新东西：
+
+- **`--dir write` 没有 L1 干扰。** 全局 store 从 Volta 起就是 write-through 的，
+  L1 不持有脏的全局数据，所以写侧曲线上任何台阶都只能是 L2。读侧则必须靠
+  `ca` / `cg` 两个 build 才能把 L1 和 L2 分开。
+- **`--dir write` 的链路方向是反的。** push 表现为发起方 TX / 归属方 RX，pull 是
+  发起方 RX / 归属方 TX。CSV 里 `wire_rx_bytes` 恒为**近端**计数器、
+  `wire_tx_bytes` 恒为**远端**计数器，两边照样必须对得上。
+- **`--dir write` 的计时含「真的落地了」。** ld/st 写 kernel 结尾有一次
+  `__threadfence_system()`，TMA 写 kernel 结尾用 `cp.async.bulk.wait_group 0`
+  而不是 `.read` 变体。否则 kernel 可能在 posted write 还在链路上飞的时候就退出，
+  测到的是发射率不是交付率。代价是每个 kernel 一次排空，摊到 `iters` 上可忽略。
+- **写侧的 verify 问归属方。** 写 kernel 全程写同一个常数（回绕造成的重叠写因此
+  无竞争），跑完在**归属方那张卡上**逐字检查——问的是「字节真的落进对端 HBM 了
+  吗」，不是「发送方以为自己发出去了吗」。
+- **TMA 的回绕在 tile 粒度上**（每 CTA 一个发射线程、4 级流水），ld/st 的回绕在
+  16 B 粒度上（每线程）。两者都保证工作集精确等于 `size` 且被完整覆盖，所以两条
+  曲线共用一根 x 轴。
+
 **为什么 `bw` 用「回绕」而不是普通 grid-stride**：512 KB 工作集上，500+ 个 CTA
 的 grid-stride 会让绝大多数 CTA 一个字节都不读，小工作集端测到的就变成「8 个 SM
 打 L2」而不是「整卡打 L2」——而 local 那个台阶正是不能被低估的对照。回绕之后每个
@@ -108,8 +143,15 @@ NO_NCU=1 ./run_all.sh             # 不跑 profiler
 ./peer_l2_probe --reader 0 --owner 1                    # 三个 mode 全跑
 ./peer_l2_probe --modes bw --sizes 1M,8M,64M,512M
 ./peer_l2_probe --modes wire --wire-sizes 8M --wire-total 64G
+./peer_l2_probe --dir write --modes bw,wire             # push 侧（st.global）
+./peer_l2_probe --via tma  --modes bw,wire              # pull 侧（cp.async.bulk）
+./peer_l2_probe --via tma --dir write --modes bw,wire   # push 侧（TMA）
 ./peer_l2_probe --help
 ```
+
+`--via tma` 需要 sm_90+；探针启动时检查 compute capability，不够就直接报错退出，
+不会去跑一个空壳 kernel。`--tma-tile`（默认 8K）控制每次 `cp.async.bulk` 的字节
+数，默认值让 4 级流水的 staging buffer 停在 48 KiB 静态上限以内。
 
 跑之前锁频（只影响绝对值；结论读的是同一次 sweep 内部的比值，掉频也活得下来）：
 
@@ -129,6 +171,17 @@ nvidia-smi -lgc <freq> -i 0,1        # 频率用 ../comm_comp/pick_clock.sh 挑
 per-SM 的、容量小、CTA 之间不共享，帮不了 GEMM 里 A tile 的跨 CTA 复用；跨设备
 可见性通常还要求 `.sys` scope 或 volatile load，本身就绕过 L1。
 
+**4×H800 上的实测结果（`results_20260814_051154`）：L1 确实缓存远端行，而且效果
+很大。** 1 MiB 工作集下默认 build 的 `RX/asked = 0.003`——链路字节少了 323 倍；
+同一个点在 `-dlcm=cg` 下是 1.000。扣掉冷填成本后 peer 的 L1 命中延迟约 31 ns，
+和 local 的 34.7 ns 同一量级，**L1 对远端行和本地行一视同仁**。台阶落在「每 SM
+足迹越过 256 KiB」处，正是 Hopper 的 unified L1/SMEM 容量。
+
+这条只对**普通 `ld` + 默认编译**成立。`--via tma` 那一栏就是用来回答「bulk copy
+是否同样填 L1」的——如果它是平的，上面这个红利对 `exp3_gemm_rs_fused` 不适用。
+另外注意反面：L1 能把一行远端数据攥住到复用几百次，所以用非 volatile 的普通 `ld`
+去读对端正在写的 flag，可以拿到任意久的陈旧值。
+
 ---
 
 ## 输出与判读
@@ -139,14 +192,23 @@ per-SM 的、容量小、CTA 之间不共享，帮不了 GEMM 里 A tile 的跨 
 verdict.txt              ← 先看这个：三个数 + 一句结论
 manifest.txt             每一步的命令 / 返回码 / 耗时
 env.txt                  git / nvcc / nvidia-smi / topo -m / nvlink -s / 计数器初值
-ca_bw.csv  ca_lat.csv  ca_wire.csv      默认 build
-cg_bw.csv  cg_lat.csv  cg_wire.csv      L1 bypass build
+ca_bw.csv  ca_lat.csv  ca_wire.csv      ld/st pull，默认 build
+cg_bw.csv  cg_lat.csv  cg_wire.csv      ld/st pull，L1 bypass build
+st_bw.csv  st_wire.csv                  ld/st push（只跑 cg：-dlcm 不管 store）
+tma_ca_*.csv  tma_cg_*.csv              TMA pull，两个 build
+tmast_bw.csv  tmast_wire.csv            TMA push
 bigbuf_wire.csv          512 MB（≫ L2，物理上不可能缓存）的定标点
-ncu_nvlink_{peer,local}.txt             NCU Nvlink section
+ncu_nvlink_{peer,local}.txt             NCU Nvlink section（ld/st pull）
 ncu_metrics_{peer,local}.txt            dram__bytes_read / lts__t_sectors ...
+ncu_{nvlink,metrics}_st_{peer,local}.txt      ld/st push
+ncu_{nvlink,metrics}_tmald_{peer,local}.txt   TMA pull
+ncu_{nvlink,metrics}_tmast_{peer,local}.txt   TMA push
 gpu_trace.csv            100 ms 采样的 SM 频率 / 功耗 / 降频原因
 load_check.log           负载下频率是否守得住
 ```
+
+`_bw.csv` / `_wire.csv` 末尾追加了 `via,dir,tma_tile_bytes` 三列（**追加不插入**，
+因为 verdict 的 awk 按列号读，旧 bundle 也得继续能读）。
 
 `verdict.txt` 只认三个数（都取自 `cg` build）：
 
@@ -160,6 +222,28 @@ TEST     peer  wire RX / asked    = 1.009  [every byte crossed the link]
 
 **如果 CONTROL 那行不成立（local 没有台阶），脚本会直接给 INCONCLUSIVE 而不是
 给结论**——仪器都没证明自己能看见 L2，peer 平坦就没有信息量。
+
+verdict 里另外三块：
+
+```
+L1       peer wire RX/asked at 1 MiB: default 0.003 vs -dlcm=cg 1.000  [L1 DOES cache peer lines]
+
+---- PUSH, ld/st: st.global into peer memory ----
+  bw  local  in-L2 ... knee 2.xx     bw  peer ... knee 1.00
+  L1? peer 64K vs 100M =  0.93x  [flat: nothing cached per-SM]
+  wire peer  1.0 MiB -> near/asked 1.000, far/asked 1.000
+---- PULL, TMA: cp.async.bulk peer gmem -> smem (default L1) ----
+---- PUSH, TMA: cp.async.bulk smem -> peer gmem ----
+```
+
+- **`L1` 那行**是刻意补上的。上面所有 L2 判据都只取 `frac_l2 ≥ 0.25` 的点——正是
+  为了不让 L1 污染 L2 结论，代价是它们**看不见 L1**。这一行看得见：同一个小工作
+  集，默认 build 对 `-dlcm=cg`。
+- **`L1?` 那行**对每条路径各算一次（最小工作集 vs 远超 L2 的点）。它是判断
+  「ld.global 上观察到的 per-SM 缓存，在这条路径上还成不成立」的那个数。TMA pull
+  那一栏如果是 `[flat]`，说明 bulk copy 不填 L1，读侧那个 L1 红利对
+  `exp3_gemm_rs_fused` **不适用**。
+- 每条路径都自带 `local` 对照，可以独立判读，不依赖别的格子。
 
 画图：
 
@@ -188,7 +272,16 @@ NCU 那侧的读法：`target=local` 时 `dram__bytes_read.sum` ≈ 8 MiB（只�
   **对比**。
 - **没有直接测「对端 L2 确实缓存了」。** 那需要在归属方观测 DRAM 流量，而 NCU
   无法把对端 kernel 之外的 peer 请求归因到某个 kernel 上。本目录只证明了「不在
-  请求方」；「在归属方」目前靠架构论证 + 上表的第三方证据。
+  请求方」；「在归属方」目前靠架构论证 + 上表的第三方证据 + `tests/ANALYSIS.md`
+  第 6 节的端到端行为证据（H20 上融合方法击穿模型下界 5–40%，因为消费者读到的是
+  刚推过来、还热在 **dst L2** 里的 tile）。
+- **`--via tma` 只测了 1D 的 `cp.async.bulk`，没测 tensor-map 变体**
+  （`cp.async.bulk.tensor`，CUTLASS 的 `SM90_TMA_LOAD` 实际用的那个）。两者共用
+  同一个 TMA 引擎和同一条 gmem 通路，地址路由不会因为多了一层 tensor map 描述符
+  而变化，但严格说这是推断。真要较真，得把 descriptor 建在 peer 指针上再跑一遍。
+- **`--via tma` 的 `local` 对照跑的是 TMA，不是 ld.global**，所以两条 via 之间的
+  绝对带宽不可直接比（发射方式、流水深度都不同）。要比的是每条 via 内部
+  local/peer 的**比值**。
 - **绝对带宽跨 bundle 不可比**（本仓库通例）：不同锁频下的数字不要放在一起。
 
 ---
