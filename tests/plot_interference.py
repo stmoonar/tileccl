@@ -289,24 +289,24 @@ def fig_sc_heatmap(out, dpi):
 
 
 def fig_sm_heatmap(out, dpi):
-    fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.6))
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 4.2))
     vmax = 1.5
     for ax, mach in zip(axes, ["rtx5000", "h20"]):
         heat_panel(ax, SM[mach], MACHINE_NAME[mach], vmax)
-    fig.suptitle("How much does compute slow communication?  "
+    fig.suptitle("How much does compute slow communication?\n"
                  "S_m = comm BW alone / comm BW overlapped  (sender side)",
-                 fontsize=10.5, y=1.00)
-    fig.text(0.5, 0.90,
-             "Receiver-side S_m is 1.00 everywhere on both machines: incoming"
-             " writes cannot be throttled by local compute.\nOn PCIe the copy"
-             " engine loses 41% under an HBM-saturated kernel; on NVLink the"
-             " under-provisioned SM movers lose instead.",
-             ha="center", fontsize=8, color=MUTED)
+                 fontsize=10.5, y=0.99)
+    fig.text(0.47, 0.885,
+             "Receiver-side S_m is 1.00 everywhere on both machines:\n"
+             "incoming writes cannot be throttled by local compute.  On PCIe"
+             " the copy engine loses 41%\nunder an HBM-saturated kernel; on"
+             " NVLink the under-provisioned SM movers lose instead.",
+             ha="center", va="top", fontsize=7.5, color=MUTED)
     sm = plt.cm.ScalarMappable(cmap=HEAT, norm=Normalize(1.0, vmax))
     cb = fig.colorbar(sm, ax=axes, fraction=0.03, pad=0.02)
     cb.set_label("S_m (slowdown factor)", fontsize=8)
     cb.outline.set_visible(False)
-    fig.subplots_adjust(top=0.72, wspace=0.25, left=0.09, right=0.88,
+    fig.subplots_adjust(top=0.72, wspace=0.25, left=0.09, right=0.86,
                         bottom=0.12)
     fig.savefig(os.path.join(out, "if_sm_heatmap.png"), dpi=dpi)
     plt.close(fig)
