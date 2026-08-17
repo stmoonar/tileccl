@@ -6,3 +6,6 @@
 	path = third_party/ThunderKittens
 	url = https://github.com/HazyResearch/ThunderKittens.git
 	branch = main
+[submodule "refs/flux"]
+	path = refs/flux
+	url = https://github.com/bytedance/flux.git
