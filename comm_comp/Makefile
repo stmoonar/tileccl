@@ -18,7 +18,7 @@ NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo -DNDEBUG \
              -Xcompiler -Wno-psabi
 
 TARGETS := exp1_ce_interference exp2_ag_gemm_granularity exp3_epilogue_remote \
-           exp3_gemm_rs_fused
+           exp3_gemm_rs_fused exp4_ag_tile_transport
 
 .PHONY: all clean
 
@@ -37,6 +37,12 @@ exp3_epilogue_remote: exp3_epilogue_remote.cu common.cuh gemm_sm90.cuh
 exp3_gemm_rs_fused: exp3_gemm_rs_fused.cu common.cuh gemm_sm90.cuh \
                     rs_barrier.cuh rs_dma_sm90.cuh rs_gemm_kernel_sm90.cuh \
                     ipc_multiproc.cuh
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+# tile-granularity AG fusion, CE vs TMA transport. No CUTLASS types; driver
+# API (cuStreamWriteValue32 / cuTensorMapEncodeTiled) is resolved at runtime
+# via cudaGetDriverEntryPoint, so no -lcuda here.
+exp4_ag_tile_transport: exp4_ag_tile_transport.cu common.cuh exp4_transport.cuh
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 clean:

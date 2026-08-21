@@ -1,6 +1,6 @@
 # comm_comp — 通信/计算干扰实验（4×H800 NVLink, sm90）
 
-三个独立的 CUDA/CUTLASS 微基准，量化通信与计算在 Hopper 上的资源竞争，
+一组独立的 CUDA/CUTLASS 微基准，量化通信与计算在 Hopper 上的资源竞争，
 实验设计参考 [flux](https://github.com/bytedance/flux) 的 **sm90** AG+GEMM 与
 GEMM+RS 实现（不是 sm80 路径）。全部单进程多卡：rank r == CUDA device r，
 P2P 走 `cudaDeviceEnablePeerAccess` + UVA，不需要 MPI / NCCL / nvshmem /
@@ -215,18 +215,83 @@ make exp3_gemm_rs_fused
 的 remote/local 比值对照，可以回答"flux 在 sm90 上选 pull 而不是
 epilogue 远端写，赚了还是亏了"。
 
+## 实验四：tile 粒度 AG 融合的传输通道 — `exp4_ag_tile_transport`
+
+flux sm90 AG+GEMM 融合的是**等待逻辑**：CE 搬运 + `cuStreamWriteValue`
+发旗标 + GEMM kernel 内自旋（论文 §3.2/§4.3），但论文从未比较过"谁来搬"
+—— copy engine（不占 SM、每次拷贝有 µs 级发起开销、只能搬连续地址）vs
+SM/TMA 驱动（牺牲 N_comm 个 SM，换来搬运路径上的布局变换和天然的细粒度
+旗标）。本实验在 tile 粒度融合下量化这条轴：**每次搬运的数据量变化时，两
+种通道对计算时间线各有什么影响**。
+
+4 卡全 AG 对称运行，单进程 UVA。计算是合成的门控负载（真实向量化加载 +
+`--intensity` 定容 FMA 链，计算性能本身不是指标），按 (行块, K-slice) 为
+单元自旋等待所属 chunk 的旗标（单调 epoch 协议，本地 chunk 预置常真值，
+与 flux "本地分片旗标预置"一致）；**两变体的消费者指令流逐条一致**（沿用
+tests/pipeline_e2e.cu 的原则），只有旗标生产者和 A 源指针不同：
+
+- `ce`：本 rank 最高优先级 comm stream 上 `cudaMemcpyPeerAsync` 拉取
+  G 个行块（连续行，字节数=依赖数据量），随后同 stream
+  `cuStreamWriteValue32` 发旗标（flux 原方案；经 `cudaGetDriverEntryPoint`
+  运行时解析，无 -lcuda）。CE 做不出 tile-blocked 布局，所以这是**模拟**：
+  搬的字节是真实行数据，但消费者从预先变换好的本地 shadow 缓冲加载。
+- `tma`：同一 kernel 里 blockIdx < n_comm 的 block 专职通信——对 peer 分片
+  的 2D tensor-map TMA load（描述符建在 peer 指针上）→ smem → 1D bulk
+  store 成本地 tile-blocked panel → `st.release.sys` 发旗标。消费者读的就
+  是真搬来的数据。grid ≤ SM 数保证全部 block 常驻，构造性避免 flux SM-AG
+  需要的"producer 已驻留"信号。
+
+扫描轴：`--g`（每次搬运聚合的行块数，粒度主轴）、`--k`（单行块
+128·K·2B ≈ 0.25–2 MiB；每 tile 字节与 FLOP 都 ∝K，通信/计算比不随 K 变，
+K 干净地暴露 CE 每拷贝固定开销的摊销）、`--n-comm`（仅 TMA）。
+
+每配置的模式行（对照组设计）：
+
+| mode | 含义 | 预期 |
+|---|---|---|
+| `compute-only` | 旗标全预置；配对基线，fused 后复测漂移 | 分母 |
+| `fused` | 真实依赖 + 真实搬运 | 主行 |
+| `comm-only` | 只搬运：CE 墙钟（rank=-1 聚合行）/ TMA 事件计时 | 带宽 |
+| `bystander` | 搬运照跑但门控直通 → 纯带宽/引擎干扰分量（挂钩 exp1） | 干扰 |
+| `local` | 同卡搬运 + 真实门控 | ≈1.00（对照） |
+| `memop-cost` | 仅 CE：纯 write-value 链 + 真实门控 | ≈1.00（对照） |
+| `arrival` | 搬运 + observer kernel 记每 chunk 到达时刻（无计算干扰） | 到达曲线 |
+
+归因：`slowdown = fused/compute-only`，`interference_sd =
+bystander/compute-only`，`stall_sd = slowdown/interference_sd`（依赖停顿
+分量）。fused 行自带 remote 单元等待时间的 p50/p95/max（kernel 内
+`%globaltimer` 时间戳，只做同卡差值；启动时打印跨卡偏移作证据）。
+
+```bash
+make exp4_ag_tile_transport
+./exp4_ag_tile_transport --k 4096 --g 1,4 --n-comm 4 --iters 10 --verify
+./exp4_ag_tile_transport --k 1024,8192 --g 1,4,16 --n-comm 8 \
+    --csv exp4.csv --dump-tiles exp4_tiles      # per-tile 时间线 + 到达曲线
+./exp4_ag_tile_transport --k 8192 --g 4 --n-comm 1,2,4,8,16 --variants tma
+```
+
+`--verify` 五件套：(a) 布局变换 vs host 独立参照；(b) TMA staging 与
+shadow 逐位一致（transform kernel 与 tensor-map 两条独立路径）；(c) CE
+blob 与 peer 分片逐位一致；(d) CE/TMA 两变体计算校验和逐位相等（可交换
+整数 wrapping add，网格划分无关）；(e) 消费者读到的 epoch 断言
+（`err_count` 列）。CSV 每行带 `flag_mech`（memop/kernel fallback，绝不
+静默混行）与 `ce_dst`（fixed/`--ce-cycle-dst`）。
+
 ## 实现备注（对照 flux / CUDA 12.9）
 
 - flux 的 CE 拷贝是 `cudaMemcpyAsync(cudaMemcpyDefault)` 作用在 cudaIPC
   指针上；这里单进程用 `cudaMemcpyPeerAsync`/UVA，走同样的 copy engine 路
   径，不需要 IPC handle 交换。
 - flux 的跨卡信号：宿主侧 `cuStreamWriteValue32_v2`（dlopen libcuda）+ 内
-  核内 system-scope 自旋。这里宿主侧编排全部用 CUDA event（无 SM 开销，
-  CUDA 12.9 无弃用问题），不需要链接 libcuda。
+  核内 system-scope 自旋。exp1–exp3 的宿主侧编排全部用 CUDA event（无 SM
+  开销，CUDA 12.9 无弃用问题），不需要链接 libcuda；exp4 的 CE 旗标是被测
+  机制本身，所以照 flux 用 `cuStreamWriteValue32`，但经
+  `cudaGetDriverEntryPoint` 运行时解析（CUTLASS 同款机制），仍不链接
+  libcuda，拿不到符号时退化为打了 `flag_mech=kernel` 标签的微 kernel。
 - 避开了 12.x 已弃用的 `cudaDeviceProp::clockRate`（用
   `cudaDeviceGetAttribute` 查询）；未使用 legacy IPC、NVML NvLink 系列等
   flux 中在新 toolkit 上有摩擦的 API。
 - `-arch=sm_90a` 必须带 `a`（WGMMA/TMA），与 flux 的 CMake 处理一致。
 - exp2 的拷贝源数据每轮重复，8192 形状下单 shard 32 MiB 可能部分驻留
   L2（H800 50 MiB），t_comm 可能略偏乐观；加大 `--sizes` 的 M/K 可消除。
-- 三个实验都支持 `--csv` 追加机器可读结果，便于画图。
+- 所有实验都支持 `--csv` 追加机器可读结果，便于画图。

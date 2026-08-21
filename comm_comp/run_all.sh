@@ -177,6 +177,7 @@ if [ "$QUICK" = "1" ]; then
   WIN=100; ITERS_FUSED=40; WARM=50; SIZES1="4096,8192"; SIZES2="8192"
   MSWEEP_V1="512x8192x8192"
   MSWEEP_V2="2048"
+  EXP4_K="2048,8192"; EXP4_G="1,4,16"
 else
   WIN=200; ITERS_FUSED=300; WARM=500
   SIZES1="2048,4096,8192"; SIZES2="8192,16384x8192x8192"
@@ -188,6 +189,7 @@ else
   # large-M plateau -- comm_sd should stay flat once waves are saturated)
   MSWEEP_V1="64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192,16384x8192x8192,32768x8192x8192"
   MSWEEP_V2="512 1024 2048 4096 8192 16384 32768"
+  EXP4_K="1024,2048,4096,8192"; EXP4_G="1,2,4,8,16"
 fi
 
 # ---------------------------------------------------------------------------
@@ -331,6 +333,36 @@ for m in $MSWEEP_V2; do
       --csv "$OUT/exp3_fused_msweep.csv"
   cleanup_fused
 done
+
+# ---------------------------------------------------------------------------
+# exp4: tile-granularity AG fusion, CE vs TMA transport (single-process, no
+# cleanup_fused analog needed)
+# ---------------------------------------------------------------------------
+run exp4_verify 900 ./exp4_ag_tile_transport \
+    --k 4096 --g 1,4 --n-comm 4 --iters 10 --verify
+# main sweep: G x K, both variants, n_comm fixed at 8
+run exp4_gsweep 2400 ./exp4_ag_tile_transport \
+    --k "$EXP4_K" --g "$EXP4_G" --n-comm 8 --verify \
+    --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_gsweep.csv" \
+    --dump-tiles "$OUT/exp4_tiles"
+# SM-sacrifice sweep: comm blocks vs bandwidth at one (K, G)
+run exp4_ncomm 1200 ./exp4_ag_tile_transport \
+    --k 8192 --g 4 --n-comm 1,2,4,8,16 --variants tma --verify \
+    --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_ncomm.csv"
+# CE with one stream per peer instead of the flux-faithful serial stream
+run exp4_streams3 900 ./exp4_ag_tile_transport \
+    --k 8192 --g "$EXP4_G" --variants ce --comm-streams 3 --verify \
+    --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_streams.csv"
+# cross-check rows: flag-set-kernel fallback priced against the memop path
+run exp4_flagkernel 600 ./exp4_ag_tile_transport \
+    --k 8192 --g 4 --variants ce --flag-kernel \
+    --modes fused,compute-only,memop-cost \
+    --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_flagkernel.csv"
+# robustness row: cycle the CE landing buffer to bound L2 write absorption
+run exp4_cycledst 600 ./exp4_ag_tile_transport \
+    --k 1024 --g 4 --variants ce --ce-cycle-dst \
+    --modes fused,compute-only,comm-only \
+    --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_cycledst.csv"
 
 # ---------------------------------------------------------------------------
 # wrap up
