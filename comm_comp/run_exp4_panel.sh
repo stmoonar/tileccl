@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-# Standalone Exp4 panel-granularity runner. Deliberately does not enable
+# Standalone Exp4 Fig2-left runner: only compute-only and fused are measured.
+# Deliberately does not enable
 # `set -e`: a failed build/case is recorded and existing results are packaged.
 # GPU clocks are locked without privilege escalation. A lock/hold failure skips
 # the formal cases but still packages diagnostics and never exits the shell.
@@ -16,7 +17,7 @@ EXP4_CLOCK_TOLERANCE_MHZ=${EXP4_CLOCK_TOLERANCE_MHZ:-15}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$EXP4_GPU_IDS}
 
 STAMP=$(date -u +%Y%m%d_%H%M%S)
-OUT="exp4_panel_${STAMP}"
+OUT="exp4_fig2_left_${STAMP}"
 FAILED=0
 SAMPLER_PID=""
 CLOCKS_LOCKED=0
@@ -180,7 +181,7 @@ else
     ) >> "$OUT/gpu_trace.csv" &
     SAMPLER_PID=$!
 
-    run_case exp4_panel_verify 900 \
+    run_case exp4_fig2_left_verify 900 \
       ./exp4_ag_tile_transport \
       --ndev 4 \
       --k 1024 \
@@ -188,49 +189,23 @@ else
       --n-comm 4 \
       --iters 5 \
       --verify \
-      --modes fused,compute-only,comm-only
+      --modes fused,compute-only
 
     validate_active_clocks
     if [ "$LAST_CASE_RC" -ne 0 ] || [ "$CLOCK_VALID" -ne 1 ]; then
       echo "!! formal experiments skipped after verify/clock-hold failure"
     else
-      run_case exp4_panel 7200 \
+      run_case exp4_fig2_left 7200 \
         ./exp4_ag_tile_transport \
         --ndev 4 \
         --k 8192 \
         --panel-h 1,2,4,8,16,32,64,128 \
         --n-comm 8 \
         --verify \
-        --modes fused,compute-only,comm-only,bystander,local,memop-cost \
+        --modes fused,compute-only \
         --warmup-ms 500 \
-        --window-ms 200 \
-        --csv "$OUT/exp4_panel.csv"
-
-      run_case exp4_panel_ce_isosm 3600 \
-        ./exp4_ag_tile_transport \
-        --ndev 4 \
-        --k 8192 \
-        --panel-h 1,8,128 \
-        --variants ce-aggregate,ce-panelized \
-        --ce-reserve-sm 8 \
-        --verify \
-        --modes fused,compute-only,bystander,memop-cost \
-        --warmup-ms 500 \
-        --window-ms 200 \
-        --csv "$OUT/exp4_panel_ce_isosm.csv"
-
-      run_case exp4_panel_ncomm 3600 \
-        ./exp4_ag_tile_transport \
-        --ndev 4 \
-        --k 8192 \
-        --panel-h 1,8,128 \
-        --variants tma \
-        --n-comm 1,2,4,8,16 \
-        --verify \
-        --modes fused,compute-only,comm-only,bystander \
-        --warmup-ms 500 \
-        --window-ms 200 \
-        --csv "$OUT/exp4_panel_ncomm.csv"
+        --window-ms 1000 \
+        --csv "$OUT/exp4_fig2_left.csv"
 
       validate_active_clocks
     fi
@@ -252,6 +227,7 @@ cp \
   exp4_transport.cuh \
   Makefile \
   README.md \
+  plot_exp4_fig2_left.py \
   run_all.sh \
   run_exp4_panel.sh \
   "$OUT/" 2>> "$OUT/package.log" || FAILED=1

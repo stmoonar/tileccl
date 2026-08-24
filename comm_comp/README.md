@@ -311,6 +311,10 @@ copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前�
     --modes fused,compute-only,comm-only,bystander,local,memop-cost \
     --warmup-ms 500 --window-ms 200 --csv exp4_panel.csv
 
+# 当前最小主实验：只生成 Fig2 左图所需的 fused/compute-only slowdown
+# （脚本含 1300 MHz 锁频、负载持频检查、verify 和结果打包）
+./run_exp4_panel.sh
+
 # 等 SM 对照：CE 也空出与 n_comm=8 相同的 8 个 compute block
 ./exp4_ag_tile_transport --k 8192 --panel-h 1,8,128 \
     --variants ce-aggregate,ce-panelized --ce-reserve-sm 8 --verify \
@@ -327,6 +331,24 @@ copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前�
 panel 模式下 CSV 仍令 `g_rb=1`，并新增末尾列 `axis=panel` 与 `panel_h=H`；
 `chunk_bytes=H×16384` 是实际每 flag 字节数。TMA 使用的通信 block 数自动截断
 到实际 job 数，避免大 H 时为空闲 comm block 永久挤掉 compute block。
+
+Fig2 左图的 `t_us_*`/`slowdown` 不使用 kernel 尾部 CUDA event：同一 kernel 的
+event 必须等待通信和计算 block 全部退出，无法表示计算角色完成。每个 persistent
+block 改用带 `memory` clobber 的 `%globaltimer` 记录起止；一次迭代取“全 grid
+最早 start → 最后一个 compute block done”。`cudaLaunchCooperativeKernel` 保证
+grid 原子驻留，启动前还要求 occupancy 恰为 1 block/SM；逐 block `%smid` 必须
+全部唯一，否则程序直接报错，不输出可用结果。`e2e_us_mean` 仍保留整 kernel 的
+CUDA-event 时间，只作诊断，不用于 Fig2 左图。
+
+每轮 cooperative grid 的全部 block 会先通过设备侧 arrival counter 汇合；最后
+一个 block 发布 `grid_ready=epoch`。CE comm stream 用 `cuStreamWaitValue32` 等待
+该值后才允许发 copy，严格保证 consumer 已驻留并开始计时，不再依赖不同 stream
+之间不受保证的宿主提交先后关系。
+
+Flag 作用域按实际 producer 选择：CE 的 `cuStreamWriteValue32` 默认带类似
+`__threadfence_system()` 的 stream fence，consumer 使用 `ld.acquire.sys`；TMA
+producer 与 consumer 同在接收 GPU，数据也已写入该卡本地 HBM，因此使用最小
+充分的 `st.release.gpu` / `ld.acquire.gpu`，避免 system scope 污染细粒度结果。
 
 ## 实现备注（对照 flux / CUDA 12.9）
 

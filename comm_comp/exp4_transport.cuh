@@ -99,9 +99,26 @@ __device__ __forceinline__ uint32_t ld_acquire_sys(const uint32_t* p) {
   return v;
 }
 
+__device__ __forceinline__ uint32_t ld_acquire_gpu(const uint32_t* p) {
+  uint32_t v;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p)
+               : "memory");
+  return v;
+}
+
 __device__ __forceinline__ void st_release_sys(uint32_t* p, uint32_t v) {
   asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v)
                : "memory");
+}
+
+__device__ __forceinline__ void st_release_gpu(uint32_t* p, uint32_t v) {
+  asm volatile("st.release.gpu.global.u32 [%0], %1;" : : "l"(p), "r"(v)
+               : "memory");
+}
+
+__device__ __forceinline__ uint32_t ld_acquire_flag(const uint32_t* p,
+                                                     int system_scope) {
+  return system_scope ? ld_acquire_sys(p) : ld_acquire_gpu(p);
 }
 
 // %globaltimer: ns-resolution clock, consistent across the SMs of one GPU.
@@ -109,8 +126,17 @@ __device__ __forceinline__ void st_release_sys(uint32_t* p, uint32_t v) {
 // same-GPU values.
 __device__ __forceinline__ uint64_t globaltimer() {
   uint64_t t;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  // The memory clobber prevents nvcc from moving surrounding loads/stores
+  // across the sample; NVIDIA's inline-PTX guide recommends this form for
+  // timing boundaries.
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t) :: "memory");
   return t;
+}
+
+__device__ __forceinline__ uint32_t smid() {
+  uint32_t id;
+  asm volatile("mov.u32 %0, %%smid;" : "=r"(id));
+  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +239,7 @@ struct DriverApi {
                               CUtensorMapInterleave, CUtensorMapSwizzle,
                               CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
   PFN_w32 write32 = nullptr;  // optional: falls back to flag_set_kernel
+  PFN_w32 wait32 = nullptr;   // required for consumer-resident CE start gate
   PFN_enc encode = nullptr;   // required
 
   void init() {
@@ -222,6 +249,14 @@ struct DriverApi {
                                 &st) == cudaSuccess &&
         st == cudaDriverEntryPointSuccess)
       write32 = (PFN_w32)fn;
+    fn = nullptr;
+    CUDA_CHECK(cudaGetDriverEntryPoint("cuStreamWaitValue32", &fn,
+                                       cudaEnableDefault, &st));
+    if (st != cudaDriverEntryPointSuccess || !fn) {
+      std::fprintf(stderr, "cuStreamWaitValue32 not available\n");
+      std::exit(1);
+    }
+    wait32 = (PFN_w32)fn;
     fn = nullptr;
     CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &fn,
                                        cudaEnableDefault, &st));
@@ -277,8 +312,18 @@ struct KCfg {
                            // bystander: one acquire load, no wait)
   int comm_enabled = 0;  // TMA comm blocks do their jobs (0 -> exit at once)
   int local_mode = 0;    // TMA comm blocks read own shard (map[3])
+  int flag_scope_sys = 0; // CE stream memop: sys; same-GPU TMA producer: gpu
   int chunk_major = 0;   // consume order (see rb_order_at)
   int log_slot = -1;     // ts_log ring slot, <0 = no logging
+  int timing_slot = -1;  // per-iteration persistent-block timing slot
+  int timing_stride = 0; // allocated block records per timing slot
+};
+
+struct BlockTiming {
+  uint64_t start_ns;
+  uint64_t done_ns;
+  uint32_t sm_id;
+  uint32_t role;  // 0 = communication block, 1 = compute block
 };
 
 // ---------------------------------------------------------------------------
@@ -290,10 +335,40 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
     const __half* __restrict__ src_blocked,  // A_shadow (CE) | A_staged (TMA)
     __half* __restrict__ staged,             // TMA comm store target
     uint32_t* flags, uint64_t* ts_log, float* sink,
-    unsigned long long* bitsum, unsigned* err) {
+    unsigned long long* bitsum, unsigned* err, BlockTiming* block_timing,
+    uint32_t* grid_arrivals, uint32_t* grid_ready) {
+  BlockTiming* my_timing = nullptr;
+  if (cfg.timing_slot >= 0) {
+    my_timing = block_timing +
+                (size_t)cfg.timing_slot * cfg.timing_stride + blockIdx.x;
+    if (threadIdx.x == 0) {
+      my_timing->sm_id = smid();
+      my_timing->role = blockIdx.x < (unsigned)cfg.n_comm ? 0u : 1u;
+      my_timing->start_ns = globaltimer();
+    }
+  }
+  // Defines the block start boundary: no worker may begin its communication
+  // or compute role before thread 0 has sampled the start timestamp.
+  __syncthreads();
+
+  // Cooperative-launch grid barrier.  Besides proving that all persistent
+  // blocks are resident, grid_ready is the CE stream's device-side start gate:
+  // no copy can begin before every waiting consumer block has arrived here.
+  if (threadIdx.x == 0) {
+    const uint32_t old = atomicAdd(grid_arrivals, 1u);
+    if (old + 1u == (uint32_t)gridDim.x)
+      st_release_sys(grid_ready, cfg.epoch);
+    while (ld_acquire_sys(grid_ready) < cfg.epoch) __nanosleep(64);
+  }
+  __syncthreads();
+
   // ---------------- comm role: pull peer panels via TMA ----------------
   if (blockIdx.x < (unsigned)cfg.n_comm) {
-    if (!cfg.comm_enabled) return;
+    if (!cfg.comm_enabled) {
+      if (threadIdx.x == 0 && my_timing)
+        my_timing->done_ns = globaltimer();
+      return;
+    }
     if (threadIdx.x != 0) return;  // lane 0 owns the whole pipeline
 
     extern __shared__ __align__(128) uint8_t smem[];
@@ -350,8 +425,9 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
       slot_base += items;
       // the flag says "data is IN HBM", so wait end-to-end, not just .read
       tma_store_wait_all<0>();
-      st_release_sys(&flags[flag_idx(owner * cfg.cps + c_in)], cfg.epoch);
+      st_release_gpu(&flags[flag_idx(owner * cfg.cps + c_in)], cfg.epoch);
     }
+    if (my_timing) my_timing->done_ns = globaltimer();
     return;  // exit when the job list is exhausted (no block migrates onto
              // the freed SM at 1 block/SM; spinning here would only burn
              // power and perturb clocks)
@@ -373,10 +449,11 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
     uint64_t t0 = 0, t1 = 0;
     if (threadIdx.x == 0) {
       t0 = globaltimer();
-      uint32_t v = ld_acquire_sys(&flags[flag_idx(c)]);
+      uint32_t v =
+          ld_acquire_flag(&flags[flag_idx(c)], cfg.flag_scope_sys);
       while (v < cfg.epoch_cmp) {  // pipeline_e2e.cu spin + backoff
         __nanosleep(128);
-        v = ld_acquire_sys(&flags[flag_idx(c)]);
+        v = ld_acquire_flag(&flags[flag_idx(c)], cfg.flag_scope_sys);
       }
       if (cfg.epoch_cmp && v != cfg.epoch && v != kArmed) atomicAdd(err, 1u);
       t1 = globaltimer();
@@ -427,6 +504,9 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
     atomicAdd(sink, facc);
     atomicAdd(bitsum, bacc);
   }
+  __syncthreads();
+  if (threadIdx.x == 0 && my_timing)
+    my_timing->done_ns = globaltimer();
 }
 
 // ---------------------------------------------------------------------------

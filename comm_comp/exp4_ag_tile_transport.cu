@@ -259,8 +259,11 @@ struct RankBuf {
   __half* A_staged = nullptr;  // same layout; TMA comm blocks rewrite remote rb
   __half* ce_dst = nullptr;    // [slot][peer][m_shard][K] CE landing area
   uint32_t* flags = nullptr;
+  uint32_t* grid_arrivals = nullptr;
+  uint32_t* grid_ready = nullptr;
   uint64_t* ts_log = nullptr;
   uint64_t* arr_log = nullptr;
+  e4::BlockTiming* block_timing = nullptr;
   float* sink = nullptr;
   unsigned long long* bitsum = nullptr;
   unsigned* err = nullptr;
@@ -275,6 +278,8 @@ struct RankBuf {
 
 struct ModeStats {
   Stats st[e4::kMaxWorld];
+  Stats kernel[e4::kMaxWorld];
+  Stats start_skew[e4::kMaxWorld];
   Stats e2e[e4::kMaxWorld];
   double host_ms_per_iter = 0;
   unsigned err_count = 0;
@@ -399,6 +404,19 @@ struct Bench {
       CUDA_CHECK(cudaFuncSetAttribute(
           e4::ag_consume_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
           (int)e4::smem_bytes()));
+      int cooperative = 0, active_blocks = 0;
+      CUDA_CHECK(cudaDeviceGetAttribute(&cooperative,
+                                        cudaDevAttrCooperativeLaunch, r));
+      CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &active_blocks, e4::ag_consume_kernel, e4::kThreads,
+          e4::smem_bytes()));
+      if (!cooperative || active_blocks != 1) {
+        std::fprintf(stderr,
+                     "GPU%d persistent launch preflight failed: cooperative=%d "
+                     "active_blocks_per_sm=%d (expected 1)\n",
+                     r, cooperative, active_blocks);
+        std::exit(1);
+      }
       RankBuf& b = R[r];
       CUDA_CHECK(cudaStreamCreateWithFlags(&b.compute, cudaStreamNonBlocking));
       CUDA_CHECK(cudaStreamCreateWithFlags(&b.obs, cudaStreamNonBlocking));
@@ -416,11 +434,18 @@ struct Bench {
       CUDA_CHECK(cudaEventCreate(&b.e_beg));
       CUDA_CHECK(cudaMalloc(&b.flags,
                             (size_t)e4::kMaxChunks * e4::kFlagStride * 4));
+      CUDA_CHECK(cudaMalloc(&b.grid_arrivals, sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&b.grid_ready, sizeof(uint32_t)));
+      CUDA_CHECK(cudaMemset(b.grid_arrivals, 0, sizeof(uint32_t)));
+      CUDA_CHECK(cudaMemset(b.grid_ready, 0, sizeof(uint32_t)));
       CUDA_CHECK(cudaMalloc(&b.ts_log, (size_t)e4::kLogIters * e4::kMaxUnits *
                                            3 * sizeof(uint64_t)));
       CUDA_CHECK(cudaMalloc(&b.arr_log, (size_t)e4::kLogIters *
                                             (e4::kMaxChunks + 1) *
                                             sizeof(uint64_t)));
+      CUDA_CHECK(cudaMalloc(&b.block_timing,
+                            (size_t)kMaxIters * n_sm *
+                                sizeof(e4::BlockTiming)));
       CUDA_CHECK(cudaMalloc(&b.sink, sizeof(float)));
       CUDA_CHECK(cudaMalloc(&b.bitsum, sizeof(unsigned long long)));
       CUDA_CHECK(cudaMalloc(&b.err, sizeof(unsigned)));
@@ -545,9 +570,17 @@ struct Bench {
   // this rank's high-priority stream(s) in ring order (exp2 pattern), each
   // chunk's copy followed by its flag publish on the same stream (flux
   // all_gather_op structure).
-  void enqueue_ce_comm(int r, Mode mode) {
+  void enqueue_ce_comm(int r, Mode mode, bool wait_consumer = true) {
     RankBuf& b = R[r];
     CUDA_CHECK(cudaSetDevice(r));
+    // The cooperative consumer grid publishes grid_ready only after every
+    // persistent block is resident and waiting.  This closes the cross-stream
+    // race where CE traffic could otherwise start before the consumer kernel.
+    if (wait_consumer)
+      for (int si = 0; si < cfg.comm_streams; ++si)
+        CU_CHECK(drv.wait32((CUstream)b.comm[si],
+                            (CUdeviceptr)b.grid_ready, epoch,
+                            CU_STREAM_WAIT_VALUE_GEQ));
     auto do_chunk = [&](int peer_i, int c_in) {
       const int owner = (r + 1 + peer_i) % world;
       cudaStream_t s = b.comm[cfg.comm_streams == 1 ? 0 : peer_i];
@@ -594,7 +627,7 @@ struct Bench {
     }
   }
 
-  void launch_consume(int r, Mode mode, int log_slot) {
+  void launch_consume(int r, Mode mode, int log_slot, int timing_slot) {
     e4::KCfg kc;
     kc.rank = r;
     kc.world = world;
@@ -615,23 +648,38 @@ struct Bench {
         (mode == M_FUSED || mode == M_LOCAL || mode == M_MEMOP) ? epoch : 0;
     kc.comm_enabled = (var == V_TMA && mode != M_COMPUTE) ? 1 : 0;
     kc.local_mode = (var == V_TMA && mode == M_LOCAL) ? 1 : 0;
+    kc.flag_scope_sys = var == V_CE ? 1 : 0;
     kc.chunk_major = (var == V_CE && cfg.comm_streams > 1) ? 1 : 0;
     kc.log_slot = log_slot;
+    kc.timing_slot = timing_slot;
+    kc.timing_stride = n_sm;
     const int grid = kc.n_comm + kc.n_compute;
     if (grid == 0) return;
     CUDA_CHECK(cudaSetDevice(r));
-    e4::ag_consume_kernel<<<grid, e4::kThreads, e4::smem_bytes(),
-                            R[r].compute>>>(
-        R[r].maps, kc, var == V_CE ? R[r].A_shadow : R[r].A_staged,
-        R[r].A_staged, R[r].flags, R[r].ts_log, R[r].sink, R[r].bitsum,
-        R[r].err);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemsetAsync(R[r].grid_arrivals, 0, sizeof(uint32_t),
+                               R[r].compute));
+    const __half* src = var == V_CE ? R[r].A_shadow : R[r].A_staged;
+    __half* staged = R[r].A_staged;
+    uint32_t* flags = R[r].flags;
+    uint64_t* ts_log = R[r].ts_log;
+    float* sink = R[r].sink;
+    unsigned long long* bitsum = R[r].bitsum;
+    unsigned* err = R[r].err;
+    e4::BlockTiming* block_timing = R[r].block_timing;
+    uint32_t* grid_arrivals = R[r].grid_arrivals;
+    uint32_t* grid_ready = R[r].grid_ready;
+    void* args[] = {&R[r].maps, &kc,       &src,    &staged, &flags,
+                    &ts_log,     &sink,     &bitsum, &err,    &block_timing,
+                    &grid_arrivals, &grid_ready};
+    CUDA_CHECK(cudaLaunchCooperativeKernel(
+        (void*)e4::ag_consume_kernel, dim3(grid), dim3(e4::kThreads), args,
+        e4::smem_bytes(), R[r].compute));
   }
 
   // one gated iteration across all ranks (generic path; CE comm-only and
   // arrival have their own loops below)
   void enqueue_iter(Mode mode, std::vector<cudaEvent_t>& prev, int slot,
-                    int log_slot) {
+                    int log_slot, int timing_slot) {
     ++epoch;
     const bool ce_comm =
         var == V_CE && (mode == M_FUSED || mode == M_BYSTANDER ||
@@ -650,7 +698,7 @@ struct Bench {
       for (int q = 0; q < world; ++q)
         CUDA_CHECK(cudaStreamWaitEvent(R[r].compute, prev[q], 0));
       CUDA_CHECK(cudaEventRecord(R[r].started[slot], R[r].compute));
-      launch_consume(r, mode, log_slot);
+      launch_consume(r, mode, log_slot, timing_slot);
       CUDA_CHECK(cudaSetDevice(r));
       CUDA_CHECK(cudaEventRecord(R[r].done[slot], R[r].compute));
     });
@@ -675,7 +723,7 @@ struct Bench {
       CUDA_CHECK(cudaEventRecord(R[r].e_beg, R[r].compute));
       prev[r] = R[r].e_beg;
     }
-    for (int w = 0; w < warm; ++w) enqueue_iter(mode, prev, 0, -1);
+    for (int w = 0; w < warm; ++w) enqueue_iter(mode, prev, 0, -1, -1);
     // re-anchor timing after warmup (exp2 discipline)
     for (int r = 0; r < world; ++r) {
       CUDA_CHECK(cudaSetDevice(r));
@@ -685,7 +733,7 @@ struct Bench {
     const int log_base = std::max(0, iters - e4::kLogIters);
     for (int i = 0; i < iters; ++i) {
       const int ls = (log_tiles && i >= log_base) ? i - log_base : -1;
-      enqueue_iter(mode, prev, i, ls);
+      enqueue_iter(mode, prev, i, ls, i);
     }
     out.host_ms_per_iter = wall_ms_since(t_enq0) / iters;
     for (int r = 0; r < world; ++r) {
@@ -697,22 +745,68 @@ struct Bench {
     }
     for (int r = 0; r < world; ++r) {
       CUDA_CHECK(cudaSetDevice(r));
-      std::vector<double> active(iters), e2e(iters);
+      std::vector<double> kernel_active(iters), e2e(iters);
       float ms = 0;
       CUDA_CHECK(cudaEventElapsedTime(&ms, R[r].e_beg, R[r].done[0]));
       e2e[0] = ms * 1000.0;
       CUDA_CHECK(
           cudaEventElapsedTime(&ms, R[r].started[0], R[r].done[0]));
-      active[0] = ms * 1000.0;
+      kernel_active[0] = ms * 1000.0;
       for (int i = 1; i < iters; ++i) {
         CUDA_CHECK(cudaEventElapsedTime(&ms, R[r].done[i - 1], R[r].done[i]));
         e2e[i] = ms * 1000.0;
         CUDA_CHECK(
             cudaEventElapsedTime(&ms, R[r].started[i], R[r].done[i]));
-        active[i] = ms * 1000.0;
+        kernel_active[i] = ms * 1000.0;
       }
-      out.st[r] = make_stats(active);
+      out.kernel[r] = make_stats(kernel_active);
       out.e2e[r] = make_stats(e2e);
+
+      const int compute_blocks = mode == M_COMMONLY ? 0 : n_compute;
+      const int grid = n_comm + compute_blocks;
+      std::vector<e4::BlockTiming> bt((size_t)iters * n_sm);
+      CUDA_CHECK(cudaMemcpy(bt.data(), R[r].block_timing,
+                            bt.size() * sizeof(e4::BlockTiming),
+                            cudaMemcpyDeviceToHost));
+      std::vector<double> compute_done_us, start_skew_us;
+      compute_done_us.reserve(iters);
+      start_skew_us.reserve(iters);
+      for (int it = 0; it < iters; ++it) {
+        uint64_t first_start = ~0ull, last_start = 0, last_compute_done = 0;
+        std::vector<uint32_t> sm_ids;
+        sm_ids.reserve(grid);
+        bool timing_ok = grid > 0;
+        for (int block = 0; block < grid; ++block) {
+          const e4::BlockTiming& t = bt[(size_t)it * n_sm + block];
+          const uint32_t expected_role = block < n_comm ? 0u : 1u;
+          timing_ok &= t.start_ns != 0 && t.done_ns >= t.start_ns;
+          timing_ok &= t.role == expected_role && t.sm_id < (uint32_t)n_sm;
+          first_start = std::min(first_start, t.start_ns);
+          last_start = std::max(last_start, t.start_ns);
+          if (expected_role == 1u)
+            last_compute_done = std::max(last_compute_done, t.done_ns);
+          sm_ids.push_back(t.sm_id);
+        }
+        std::sort(sm_ids.begin(), sm_ids.end());
+        timing_ok &= std::unique(sm_ids.begin(), sm_ids.end()) == sm_ids.end();
+        if (!timing_ok || (compute_blocks > 0 && last_compute_done == 0)) {
+          std::fprintf(stderr,
+                       "GPU%d persistent timing integrity failure: mode=%d "
+                       "iter=%d grid=%d compute=%d\n",
+                       r, (int)mode, it, grid, compute_blocks);
+          std::exit(1);
+        }
+        start_skew_us.push_back((double)(last_start - first_start) / 1e3);
+        if (compute_blocks > 0)
+          compute_done_us.push_back(
+              (double)(last_compute_done - first_start) / 1e3);
+      }
+      // t_us_* is now the requested dependent-compute completion time.  For a
+      // communication-only mode there is no compute role, so retain the whole
+      // kernel event duration for backward-compatible transport reporting.
+      out.st[r] = compute_blocks > 0 ? make_stats(compute_done_us)
+                                     : out.kernel[r];
+      out.start_skew[r] = make_stats(start_skew_us);
       unsigned e = 0;
       CUDA_CHECK(cudaMemcpy(&e, R[r].err, sizeof(e), cudaMemcpyDeviceToHost));
       out.err_count += e;
@@ -725,7 +819,8 @@ struct Bench {
   double run_ce_comm_only_us(double window_ms, int* reps_out) {
     auto pass = [&]() {
       ++epoch;
-      parallel_ranks([&](int r) { enqueue_ce_comm(r, M_FUSED); });
+      parallel_ranks(
+          [&](int r) { enqueue_ce_comm(r, M_FUSED, false); });
       parallel_ranks([&](int r) {
         CUDA_CHECK(cudaSetDevice(r));
         for (int si = 0; si < cfg.comm_streams; ++si)
@@ -778,9 +873,11 @@ struct Bench {
         }
       });
       if (var == V_CE)
-        parallel_ranks([&](int r) { enqueue_ce_comm(r, M_FUSED); });
+        parallel_ranks(
+            [&](int r) { enqueue_ce_comm(r, M_FUSED, false); });
       else
-        parallel_ranks([&](int r) { launch_consume(r, M_ARRIVAL, -1); });
+        parallel_ranks(
+            [&](int r) { launch_consume(r, M_ARRIVAL, -1, -1); });
       parallel_ranks([&](int r) {
         CUDA_CHECK(cudaSetDevice(r));
         const int obs_blocks = std::max(1, std::min(64, (n_chunks + 255) / 256));
@@ -846,7 +943,7 @@ struct Bench {
       CUDA_CHECK(cudaEventRecord(R[r].e_beg, R[r].compute));
       prev[r] = R[r].e_beg;
     }
-    enqueue_iter(M_FUSED, prev, 0, -1);
+    enqueue_iter(M_FUSED, prev, 0, -1, -1);
     for (int r = 0; r < world; ++r) {
       CUDA_CHECK(cudaSetDevice(r));
       CUDA_CHECK(cudaDeviceSynchronize());
@@ -860,7 +957,7 @@ struct Bench {
       CUDA_CHECK(cudaEventRecord(R[r].e_beg, R[r].compute));
       prev[r] = R[r].e_beg;
     }
-    enqueue_iter(M_COMPUTE, prev, 0, -1);
+    enqueue_iter(M_COMPUTE, prev, 0, -1, -1);
     for (int r = 0; r < world; ++r) {
       CUDA_CHECK(cudaSetDevice(r));
       CUDA_CHECK(cudaDeviceSynchronize());
@@ -1054,6 +1151,8 @@ int main(int argc, char** argv) {
                 "controls panels per ready flag\n");
   std::printf("host rank submission: %s\n",
               cfg.parallel_host ? "parallel workers" : "serial diagnostic");
+  std::printf("timing: cooperative persistent grid, 1 block/SM; t_us_* = "
+              "earliest block start -> last compute block done (%%globaltimer)\n");
   if (!b.drv.write32 && !cfg.flag_kernel)
     std::printf("!! cuStreamWriteValue32 unavailable -> flag-kernel fallback\n");
   for (int r = 0; r < b.world; ++r) print_device_line(r);
@@ -1309,15 +1408,26 @@ int main(int argc, char** argv) {
             const double bus = base.st[r].mean;
             const double drift =
                 bus > 0 ? (base2.st[r].mean - bus) / bus * 100.0 : 0;
+            const double abs_drift = drift < 0 ? -drift : drift;
+            if (abs_drift > 2.0) {
+              std::fprintf(stderr,
+                           "rank%d paired compute baseline drift %.2f%% exceeds "
+                           "2%%; refusing timing result\n",
+                           r, drift);
+              std::exit(1);
+            }
             const double sd =
                 (w_fused && bus > 0) ? fused.st[r].mean / bus : 0;
             const double isd =
                 (w_byst && bus > 0) ? byst.st[r].mean / bus : 0;
             const double ssd = (sd > 0 && isd > 0) ? sd / isd : 0;
-            std::printf("  rank%d: base-active %.1fus", r, bus);
+            std::printf("  rank%d: base-compute %.1fus (kernel %.1fus)", r, bus,
+                        base.kernel[r].mean);
             if (w_fused)
-              std::printf(" fused-active %.1fus e2e %.1fus sd %.3f",
-                          fused.st[r].mean, fused.e2e[r].mean, sd);
+              std::printf(" fused-compute %.1fus (kernel %.1fus) e2e %.1fus "
+                          "sd %.3f",
+                          fused.st[r].mean, fused.kernel[r].mean,
+                          fused.e2e[r].mean, sd);
             if (w_byst) std::printf(" interf %.3f", isd);
             if (ssd > 0) std::printf(" stall %.3f", ssd);
             if (w_fused)
@@ -1430,7 +1540,10 @@ int main(int argc, char** argv) {
   }
   if (csv) std::fclose(csv);
   std::printf(
-      "\nslowdown = fused/compute-only (same variant & grid). interference_sd"
+      "\nt_us_* = earliest persistent-block start to last compute-block done "
+      "(same-GPU %%globaltimer); e2e_us_mean = whole-kernel CUDA-event "
+      "interval.\nslowdown = fused/compute-only (same variant & grid). "
+      "interference_sd"
       " = bystander/compute-only\n(comm running, gates pre-armed -> pure "
       "bandwidth/engine interference). stall_sd = slowdown /\ninterference_sd"
       " is a descriptive fused/bystander ratio, not an additive causal "
