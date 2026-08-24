@@ -34,8 +34,8 @@
 //
 // Modes per config: fused, compute-only (paired baseline, re-checked for
 // drift), comm-only, bystander (comm runs, gates pass -> pure interference),
-// local (same-GPU transport + real gating, a-priori ~1.00), memop-cost (CE
-// flag chain alone, a-priori ~1.00), arrival (comm + an observer kernel
+// local (same-GPU transport + real gating), memop-cost (CE flag chain alone),
+// arrival (comm + an observer kernel
 // recording per-chunk arrival times).
 //
 // Usage:
@@ -53,7 +53,11 @@
 
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define CU_CHECK(expr)                                                       \
@@ -81,9 +85,10 @@ enum Mode {
 };
 
 enum Variant { V_CE = 0, V_TMA };
-static const char* kVarName[] = {"ce", "tma"};
 
-constexpr int kMaxIters = 256;
+// K=8192 compute-only is ~0.5--0.7 ms on H800; 1024 permits the requested
+// 500 ms warmup and 200 ms timing window instead of silently truncating them.
+constexpr int kMaxIters = 1024;
 constexpr int kCycleSlots = 8;  // --ce-cycle-dst rotation depth
 
 struct Config {
@@ -91,18 +96,22 @@ struct Config {
                            // consumer; --slices plays the many-CTAs-per-rb role)
   std::vector<int> ks = {1024, 2048, 4096, 8192};
   std::vector<int> gs = {1, 2, 4, 8, 16};
+  std::vector<int> panel_hs;
   std::vector<int> ncomms = {8};
   std::vector<std::string> variants = {"ce", "tma"};
   std::vector<std::string> modes = {"fused",     "compute-only", "comm-only",
                                     "bystander", "local",        "memop-cost",
                                     "arrival"};
   int comm_streams = 1;  // 1 = flux-faithful single stream, 3 = one per peer
+  int ce_reserve_sm = 0; // iso-SM control: leave this many SM slots unused
   int intensity = 1024;  // FMA ops per loaded 16 B vector
   int slices = 16;       // K-slices per row-block (compute units per rb)
   double window_ms = 200, warmup_ms = 0;
   int iters = 0;  // 0 = auto from window
   int ndev = 0;
   bool verify = false, flag_kernel = false, ce_cycle_dst = false;
+  bool parallel_host = true;
+  bool panel_mode = false;
   std::string csv, dump;
 };
 
@@ -113,11 +122,15 @@ static void usage(const char* prog) {
       "  --n N            recorded in the CSV only (default 8192)\n"
       "  --k LIST         K sweep (default 1024,2048,4096,8192; K %% 64 == 0)\n"
       "  --g LIST         row-blocks per copy+flag (default 1,2,4,8,16)\n"
+      "  --panel-h LIST   supplement: 128x64 panels per flag; enables\n"
+      "                   ce-aggregate,ce-panelized,tma variants\n"
       "  --n-comm LIST    TMA comm blocks sweep (default 8)\n"
-      "  --variants LIST  ce,tma (default both)\n"
+      "  --variants LIST  ce,tma; panel mode also accepts ce-aggregate,\n"
+      "                   ce-panelized (default all three)\n"
       "  --modes LIST     fused,compute-only,comm-only,bystander,local,\n"
       "                   memop-cost,arrival (default all)\n"
       "  --comm-streams N CE streams: 1 = serial ring (flux), 3 = per peer\n"
+      "  --ce-reserve-sm N leave N compute blocks unused for iso-SM control\n"
       "  --intensity N    FMA ops per 16 B vector (default 1024)\n"
       "  --slices N       K-slices per row-block (default 16)\n"
       "  --window-ms MS   timing window per mode (default 200)\n"
@@ -128,7 +141,8 @@ static void usage(const char* prog) {
       "  --csv PATH       append machine-readable rows\n"
       "  --dump-tiles PRE write PRE.tiles.rank<r>.csv + PRE.arrival.rank<r>.csv\n"
       "  --flag-kernel    force the flag-set-kernel fallback (CE publish)\n"
-      "  --ce-cycle-dst   cycle the CE destination through %d slots\n",
+      "  --ce-cycle-dst   cycle the CE destination through %d slots\n"
+      "  --serial-host    diagnostic: submit ranks serially (default parallel)\n",
       prog, kCycleSlots);
 }
 
@@ -153,10 +167,15 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--n") c.n = std::atoi(next().c_str());
     else if (a == "--k") { ints(c.ks); k_set = true; }
     else if (a == "--g") { ints(c.gs); g_set = true; }
+    else if (a == "--panel-h") {
+      ints(c.panel_hs);
+      c.panel_mode = true;
+    }
     else if (a == "--n-comm") { ints(c.ncomms); nc_set = true; }
     else if (a == "--variants") { c.variants = split_csv(next()); var_set = true; }
     else if (a == "--modes") { c.modes = split_csv(next()); mode_set = true; }
     else if (a == "--comm-streams") c.comm_streams = std::atoi(next().c_str());
+    else if (a == "--ce-reserve-sm") c.ce_reserve_sm = std::atoi(next().c_str());
     else if (a == "--intensity") c.intensity = std::atoi(next().c_str());
     else if (a == "--slices") c.slices = std::atoi(next().c_str());
     else if (a == "--window-ms") c.window_ms = std::atof(next().c_str());
@@ -168,6 +187,7 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--dump-tiles") c.dump = next();
     else if (a == "--flag-kernel") c.flag_kernel = true;
     else if (a == "--ce-cycle-dst") c.ce_cycle_dst = true;
+    else if (a == "--serial-host") c.parallel_host = false;
     else if (a == "-h" || a == "--help") { usage(argv[0]); std::exit(0); }
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
@@ -179,6 +199,42 @@ static Config parse_args(int argc, char** argv) {
   if (c.comm_streams != 1 && c.comm_streams != 3) {
     std::fprintf(stderr, "--comm-streams must be 1 or 3\n");
     std::exit(1);
+  }
+  if (c.ce_reserve_sm < 0) {
+    std::fprintf(stderr, "--ce-reserve-sm must be non-negative\n");
+    std::exit(1);
+  }
+  if (c.panel_mode) {
+    if (c.panel_hs.empty()) {
+      std::fprintf(stderr, "--panel-h requires at least one value\n");
+      std::exit(1);
+    }
+    if (g_set) {
+      std::fprintf(stderr, "--panel-h and --g are separate axes; omit --g in panel mode\n");
+      std::exit(1);
+    }
+    if (!var_set)
+      c.variants = {"ce-aggregate", "ce-panelized", "tma"};
+    if (c.comm_streams != 1) {
+      std::fprintf(stderr, "panel mode currently requires --comm-streams 1\n");
+      std::exit(1);
+    }
+    for (int h : c.panel_hs) {
+      if (h < 1) {
+        std::fprintf(stderr, "--panel-h values must be positive\n");
+        std::exit(1);
+      }
+    }
+  }
+  for (const auto& v : c.variants) {
+    const bool ok = v == "ce" || v == "tma" ||
+                    (c.panel_mode &&
+                     (v == "ce-aggregate" || v == "ce-panelized"));
+    if (!ok) {
+      std::fprintf(stderr, "unsupported variant '%s'%s\n", v.c_str(),
+                   c.panel_mode ? " in panel mode" : "");
+      std::exit(1);
+    }
   }
   return c;
 }
@@ -208,6 +264,7 @@ struct RankBuf {
   unsigned* err = nullptr;
   cudaStream_t compute = nullptr, obs = nullptr;
   std::vector<cudaStream_t> comm;              // 3, priority hi
+  std::vector<cudaEvent_t> started;            // kernel-active begin
   std::vector<cudaEvent_t> done;               // kMaxIters
   std::vector<cudaEvent_t> done_o;             // kLogIters (arrival)
   cudaEvent_t e_beg = nullptr;
@@ -216,6 +273,7 @@ struct RankBuf {
 
 struct ModeStats {
   Stats st[e4::kMaxWorld];
+  Stats e2e[e4::kMaxWorld];
   double host_ms_per_iter = 0;
   unsigned err_count = 0;
 };
@@ -230,6 +288,12 @@ struct Bench {
   e4::DriverApi drv;
   bool use_memop = false;
   std::vector<RankBuf> R;
+  std::vector<std::thread> workers;
+  std::mutex worker_mu;
+  std::condition_variable worker_cv, worker_done_cv;
+  std::function<void(int)> worker_task;
+  int worker_generation = 0, worker_done = 0;
+  bool worker_stop = false;
 
   // per-K geometry
   int M = 0, K = 0, P = 0, m_shard = 0, rps = 0, n_rb = 0;
@@ -237,7 +301,9 @@ struct Bench {
 
   // per-config
   Variant var = V_CE;
-  int G = 1, cps = 0, n_chunks = 0, n_comm = 0, n_compute = 0;
+  int G = 1, H = 0, cpr = 0, cps = 0, n_chunks = 0;
+  int n_comm = 0, n_compute = 0;
+  bool ce_panelized = false;
   int chunk_major = 0;
 
   uint32_t epoch = 0;
@@ -249,6 +315,62 @@ struct Bench {
     return cfg.ce_cycle_dst ? (size_t)(e % kCycleSlots) * ce_slot_elems() : 0;
   }
   int n_jobs() const { return (world - 1) * cps; }
+  const char* var_name() const {
+    if (var == V_TMA) return "tma";
+    if (!cfg.panel_mode) return "ce";
+    return ce_panelized ? "ce-panelized" : "ce-aggregate";
+  }
+
+  void start_workers() {
+    if (!cfg.parallel_host) return;
+    for (int r = 0; r < world; ++r) {
+      workers.emplace_back([this, r]() {
+        int seen = 0;
+        for (;;) {
+          std::function<void(int)> task;
+          {
+            std::unique_lock<std::mutex> lock(worker_mu);
+            worker_cv.wait(lock, [&] {
+              return worker_stop || worker_generation != seen;
+            });
+            if (worker_stop) return;
+            seen = worker_generation;
+            task = worker_task;
+          }
+          task(r);
+          {
+            std::lock_guard<std::mutex> lock(worker_mu);
+            if (++worker_done == world) worker_done_cv.notify_one();
+          }
+        }
+      });
+    }
+  }
+
+  void parallel_ranks(const std::function<void(int)>& task) {
+    if (!cfg.parallel_host) {
+      for (int r = 0; r < world; ++r) task(r);
+      return;
+    }
+    std::unique_lock<std::mutex> lock(worker_mu);
+    worker_task = task;
+    worker_done = 0;
+    ++worker_generation;
+    worker_cv.notify_all();
+    worker_done_cv.wait(lock, [&] { return worker_done == world; });
+  }
+
+  void stop_workers() {
+    if (workers.empty()) return;
+    {
+      std::lock_guard<std::mutex> lock(worker_mu);
+      worker_stop = true;
+      ++worker_generation;
+    }
+    worker_cv.notify_all();
+    for (auto& w : workers) w.join();
+    workers.clear();
+  }
 
   // ------------------------------------------------------------------ setup
   void init_devices() {
@@ -284,6 +406,8 @@ struct Bench {
         CUDA_CHECK(cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, hi));
       b.done.resize(kMaxIters);
       for (auto& e : b.done) CUDA_CHECK(cudaEventCreate(&e));
+      b.started.resize(kMaxIters);
+      for (auto& e : b.started) CUDA_CHECK(cudaEventCreate(&e));
       b.done_o.resize(e4::kLogIters);
       for (auto& e : b.done_o) CUDA_CHECK(cudaEventCreate(&e));
       CUDA_CHECK(cudaEventCreate(&b.e_beg));
@@ -298,6 +422,7 @@ struct Bench {
       CUDA_CHECK(cudaMalloc(&b.bitsum, sizeof(unsigned long long)));
       CUDA_CHECK(cudaMalloc(&b.err, sizeof(unsigned)));
     }
+    start_workers();
   }
 
   // %globaltimer sanity: back-to-back one-thread probes on every device.
@@ -335,8 +460,11 @@ struct Bench {
     m_shard = M / world;
     rps = m_shard / e4::kRbRows;
     n_rb = M / e4::kRbRows;
-    slices_eff = (cfg.slices > 0 && P % cfg.slices == 0) ? cfg.slices : 1;
-    if (slices_eff != cfg.slices)
+    slices_eff = cfg.panel_mode
+                     ? P
+                     : ((cfg.slices > 0 && P % cfg.slices == 0) ? cfg.slices
+                                                                 : 1);
+    if (!cfg.panel_mode && slices_eff != cfg.slices)
       std::fprintf(stderr, "note: K=%d -> P=%d not divisible by --slices %d, "
                            "using slices=1\n", K, P, cfg.slices);
     n_units = n_rb * slices_eff;
@@ -372,12 +500,13 @@ struct Bench {
     for (int r = 0; r < world; ++r) {
       CUDA_CHECK(cudaSetDevice(r));
       CUDA_CHECK(cudaDeviceSynchronize());
-      // TMA descriptors over the (peer) shards; [3] = self for local mode
+      // TMA descriptors over peer shards; last slot = self for local mode.
       for (int i = 0; i < world - 1; ++i) {
         const int owner = (r + 1 + i) % world;
         e4::encode_tmap_2d(drv, &R[r].maps.m[i], R[owner].A_src, K, m_shard);
       }
-      e4::encode_tmap_2d(drv, &R[r].maps.m[3], R[r].A_src, K, m_shard);
+      e4::encode_tmap_2d(drv, &R[r].maps.m[e4::kMaxWorld - 1], R[r].A_src,
+                         K, m_shard);
     }
   }
 
@@ -419,17 +548,29 @@ struct Bench {
     auto do_chunk = [&](int peer_i, int c_in) {
       const int owner = (r + 1 + peer_i) % world;
       cudaStream_t s = b.comm[cfg.comm_streams == 1 ? 0 : peer_i];
-      const size_t elems = (size_t)G * e4::kRbRows * K;
+      const size_t elems = cfg.panel_mode
+                               ? (size_t)H * e4::kPanelElems
+                               : (size_t)G * e4::kRbRows * K;
       const size_t off = (size_t)c_in * elems;
       if (mode != M_MEMOP) {
         __half* dst =
             b.ce_dst + ce_cycle_off(epoch) + (size_t)peer_i * shard_elems() + off;
-        if (mode == M_LOCAL) {
-          CUDA_CHECK(cudaMemcpyAsync(dst, b.A_src + off, elems * 2,
-                                     cudaMemcpyDeviceToDevice, s));
+        const __half* src =
+            mode == M_LOCAL ? b.A_src + off : R[owner].A_src + off;
+        auto copy_one = [&](size_t elem_off, size_t n_elem) {
+          if (mode == M_LOCAL) {
+            CUDA_CHECK(cudaMemcpyAsync(dst + elem_off, src + elem_off,
+                                       n_elem * 2, cudaMemcpyDeviceToDevice, s));
+          } else {
+            CUDA_CHECK(cudaMemcpyPeerAsync(dst + elem_off, r, src + elem_off,
+                                           owner, n_elem * 2, s));
+          }
+        };
+        if (cfg.panel_mode && ce_panelized) {
+          for (int p = 0; p < H; ++p)
+            copy_one((size_t)p * e4::kPanelElems, e4::kPanelElems);
         } else {
-          CUDA_CHECK(cudaMemcpyPeerAsync(dst, r, R[owner].A_src + off, owner,
-                                         elems * 2, s));
+          copy_one(0, elems);
         }
       }
       uint32_t* flag = b.flags + e4::flag_idx(owner * cps + c_in);
@@ -458,6 +599,9 @@ struct Bench {
     kc.rb_per_shard = rps;
     kc.G = G;
     kc.cps = cps;
+    kc.panel_mode = cfg.panel_mode ? 1 : 0;
+    kc.H = H;
+    kc.cpr = cpr;
     kc.n_comm = (var == V_TMA) ? n_comm : 0;
     kc.n_compute = (mode == M_COMMONLY || mode == M_ARRIVAL) ? 0 : n_compute;
     kc.n_units = n_units;
@@ -489,7 +633,7 @@ struct Bench {
     const bool ce_comm =
         var == V_CE && (mode == M_FUSED || mode == M_BYSTANDER ||
                         mode == M_LOCAL || mode == M_MEMOP);
-    for (int r = 0; r < world; ++r) {
+    parallel_ranks([&](int r) {
       CUDA_CHECK(cudaSetDevice(r));
       if (ce_comm)
         for (int si = 0; si < cfg.comm_streams; ++si)
@@ -497,14 +641,13 @@ struct Bench {
             CUDA_CHECK(cudaStreamWaitEvent(R[r].comm[si], prev[q], 0));
       for (int q = 0; q < world; ++q)
         CUDA_CHECK(cudaStreamWaitEvent(R[r].compute, prev[q], 0));
-    }
-    if (ce_comm)
-      for (int r = 0; r < world; ++r) enqueue_ce_comm(r, mode);
-    for (int r = 0; r < world; ++r) {
+      if (ce_comm) enqueue_ce_comm(r, mode);
+      CUDA_CHECK(cudaSetDevice(r));
+      CUDA_CHECK(cudaEventRecord(R[r].started[slot], R[r].compute));
       launch_consume(r, mode, log_slot);
       CUDA_CHECK(cudaSetDevice(r));
       CUDA_CHECK(cudaEventRecord(R[r].done[slot], R[r].compute));
-    }
+    });
     for (int r = 0; r < world; ++r) prev[r] = R[r].done[slot];
   }
 
@@ -544,15 +687,22 @@ struct Bench {
     }
     for (int r = 0; r < world; ++r) {
       CUDA_CHECK(cudaSetDevice(r));
-      std::vector<double> per(iters);
+      std::vector<double> active(iters), e2e(iters);
       float ms = 0;
       CUDA_CHECK(cudaEventElapsedTime(&ms, R[r].e_beg, R[r].done[0]));
-      per[0] = ms * 1000.0;
+      e2e[0] = ms * 1000.0;
+      CUDA_CHECK(
+          cudaEventElapsedTime(&ms, R[r].started[0], R[r].done[0]));
+      active[0] = ms * 1000.0;
       for (int i = 1; i < iters; ++i) {
         CUDA_CHECK(cudaEventElapsedTime(&ms, R[r].done[i - 1], R[r].done[i]));
-        per[i] = ms * 1000.0;
+        e2e[i] = ms * 1000.0;
+        CUDA_CHECK(
+            cudaEventElapsedTime(&ms, R[r].started[i], R[r].done[i]));
+        active[i] = ms * 1000.0;
       }
-      out.st[r] = make_stats(per);
+      out.st[r] = make_stats(active);
+      out.e2e[r] = make_stats(e2e);
       unsigned e = 0;
       CUDA_CHECK(cudaMemcpy(&e, R[r].err, sizeof(e), cudaMemcpyDeviceToHost));
       out.err_count += e;
@@ -565,12 +715,12 @@ struct Bench {
   double run_ce_comm_only_us(int reps) {
     auto pass = [&]() {
       ++epoch;
-      for (int r = 0; r < world; ++r) enqueue_ce_comm(r, M_FUSED);
-      for (int r = 0; r < world; ++r) {
+      parallel_ranks([&](int r) { enqueue_ce_comm(r, M_FUSED); });
+      parallel_ranks([&](int r) {
         CUDA_CHECK(cudaSetDevice(r));
         for (int si = 0; si < cfg.comm_streams; ++si)
           CUDA_CHECK(cudaStreamSynchronize(R[r].comm[si]));
-      }
+      });
     };
     for (int w = 0; w < 2; ++w) pass();
     const auto t0 = std::chrono::steady_clock::now();
@@ -596,7 +746,7 @@ struct Bench {
     const int iters = e4::kLogIters;
     for (int it = 0; it < iters; ++it) {
       ++epoch;
-      for (int r = 0; r < world; ++r) {
+      parallel_ranks([&](int r) {
         CUDA_CHECK(cudaSetDevice(r));
         for (int q = 0; q < world; ++q) {
           CUDA_CHECK(cudaStreamWaitEvent(R[r].obs, prev[q], 0));
@@ -607,19 +757,20 @@ struct Bench {
             CUDA_CHECK(cudaStreamWaitEvent(R[r].compute, prev[q], 0));
           }
         }
-      }
+      });
       if (var == V_CE)
-        for (int r = 0; r < world; ++r) enqueue_ce_comm(r, M_FUSED);
+        parallel_ranks([&](int r) { enqueue_ce_comm(r, M_FUSED); });
       else
-        for (int r = 0; r < world; ++r) launch_consume(r, M_ARRIVAL, -1);
-      for (int r = 0; r < world; ++r) {
+        parallel_ranks([&](int r) { launch_consume(r, M_ARRIVAL, -1); });
+      parallel_ranks([&](int r) {
         CUDA_CHECK(cudaSetDevice(r));
-        e4::observer_kernel<<<1, 64, 0, R[r].obs>>>(
+        const int obs_blocks = std::max(1, std::min(64, (n_chunks + 255) / 256));
+        e4::observer_kernel<<<obs_blocks, 256, 0, R[r].obs>>>(
             R[r].flags, n_chunks, epoch,
             R[r].arr_log + (size_t)it * (e4::kMaxChunks + 1));
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(R[r].done_o[it], R[r].obs));
-      }
+      });
       // the observer only finishes once every flag has arrived, so its event
       // alone is a sufficient gate for the next iteration
       for (int r = 0; r < world; ++r) prev[r] = R[r].done_o[it];
@@ -807,6 +958,17 @@ struct Bench {
   }
 
   // ------------------------------------------------------------- statistics
+  int unit_rb(int i, int rank) const {
+    const int units_per_rb = cfg.panel_mode ? P : slices_eff;
+    return e4::rb_order_at(i / units_per_rb, rank, world, rps, G,
+                           chunk_major);
+  }
+
+  int unit_chunk(int i, int rank) const {
+    const int rb = unit_rb(i, rank);
+    return cfg.panel_mode ? rb * cpr + (i % P) / H : rb / G;
+  }
+
   // remote-unit wait times from the per-tile timestamp ring (local units
   // pass their pre-armed flag in one load and would only dilute the stats)
   Stats wait_stats(int r, int n_logged) {
@@ -818,8 +980,7 @@ struct Bench {
     waits.reserve((size_t)n_logged * n_units);
     for (int s = 0; s < n_logged; ++s)
       for (int i = 0; i < n_units; ++i) {
-        const int rb = e4::rb_order_at(i / slices_eff, r, world, rps, G,
-                                       chunk_major);
+        const int rb = unit_rb(i, r);
         if (rb / rps == r) continue;
         const uint64_t* e = &h[((size_t)s * e4::kMaxUnits + i) * 3];
         waits.push_back((double)(e[1] - e[0]) / 1e3);
@@ -834,11 +995,12 @@ struct Bench {
                           cudaMemcpyDeviceToHost));
     for (int s = 0; s < n_logged; ++s)
       for (int i = 0; i < n_units; ++i) {
-        const int rb = e4::rb_order_at(i / slices_eff, r, world, rps, G,
-                                       chunk_major);
+        const int rb = unit_rb(i, r);
+        const int chunk = unit_chunk(i, r);
         const uint64_t* e = &h[((size_t)s * e4::kMaxUnits + i) * 3];
         std::fprintf(f, "%s,%d,%d,%d,%d,%d,%d,%d,%d,%llu,%llu,%llu\n",
-                     kVarName[var], K, G, n_comm, s, i, rb, rb / G, rb / rps,
+                     var_name(), K, cfg.panel_mode ? H : G, n_comm, s, i, rb,
+                     chunk, rb / rps,
                      (unsigned long long)e[0], (unsigned long long)e[1],
                      (unsigned long long)e[2]);
       }
@@ -861,12 +1023,18 @@ int main(int argc, char** argv) {
   const Config& cfg = b.cfg;
   b.init_devices();
 
-  std::printf("=== exp4: tile-granularity AG fusion, CE vs TMA transport ===\n");
+  std::printf("=== exp4: tile-granularity AG fusion, CE vs TMA transport%s ===\n",
+              cfg.panel_mode ? " [panel supplement]" : "");
   std::printf("world %d, %d SMs, flag mech %s, comm streams %d, intensity %d, "
               "slices %d%s\n",
               b.world, b.n_sm, b.use_memop ? "memop" : "kernel",
               cfg.comm_streams, cfg.intensity, cfg.slices,
               cfg.ce_cycle_dst ? ", ce-cycle-dst" : "");
+  if (cfg.panel_mode)
+    std::printf("panel mode: one unit = 128x64 fp16 = 16 KiB; --panel-h "
+                "controls panels per ready flag\n");
+  std::printf("host rank submission: %s\n",
+              cfg.parallel_host ? "parallel workers" : "serial diagnostic");
   if (!b.drv.write32 && !cfg.flag_kernel)
     std::printf("!! cuStreamWriteValue32 unavailable -> flag-kernel fallback\n");
   for (int r = 0; r < b.world; ++r) print_device_line(r);
@@ -876,6 +1044,7 @@ int main(int argc, char** argv) {
   if (cfg.m % (e4::kRbRows * b.world)) {
     std::fprintf(stderr, "M=%d must be a multiple of %d\n", cfg.m,
                  e4::kRbRows * b.world);
+    b.stop_workers();
     return 1;
   }
 
@@ -890,7 +1059,8 @@ int main(int argc, char** argv) {
                    "t_us_p50,t_us_p95,t_us_min,t_us_max,compute_only_us,"
                    "drift_pct,slowdown,interference_sd,stall_sd,comm_gbps,"
                    "wait_p50_us,wait_p95_us,wait_max_us,bitsum_hex,err_count,"
-                   "verify\n");
+                   "verify,axis,panel_h,e2e_us_mean,host_enqueue_ms,"
+                   "ce_reserve_sm\n");
   }
   std::vector<FILE*> dt(b.world, nullptr), da(b.world, nullptr);
   if (!cfg.dump.empty()) {
@@ -900,13 +1070,13 @@ int main(int argc, char** argv) {
                     cfg.dump.c_str(), r);
       dt[r] = std::fopen(path, "a");
       if (dt[r])
-        std::fprintf(dt[r], "variant,k,g_rb,n_comm,iter,unit,rb,chunk,peer,"
+        std::fprintf(dt[r], "variant,k,granularity,n_comm,iter,unit,rb,chunk,peer,"
                             "t_wait_begin_ns,t_flag_seen_ns,t_done_ns\n");
       std::snprintf(path, sizeof path, "%s.arrival.rank%d.csv",
                     cfg.dump.c_str(), r);
       da[r] = std::fopen(path, "a");
       if (da[r])
-        std::fprintf(da[r], "variant,k,g_rb,n_comm,iter,chunk,peer,t_arm_ns,"
+        std::fprintf(da[r], "variant,k,granularity,n_comm,iter,chunk,peer,t_arm_ns,"
                             "t_arrival_ns\n");
     }
   }
@@ -933,10 +1103,18 @@ int main(int argc, char** argv) {
     const double remote_bytes =
         (double)(b.world - 1) * b.m_shard * b.K * 2;  // per rank per iter
 
-    for (int g : cfg.gs) {
-      if (g < 1 || b.rps % g) {
-        std::fprintf(stderr, "skip G=%d: %d row-blocks/shard not divisible\n",
-                     g, b.rps);
+    const std::vector<int>& granularities =
+        cfg.panel_mode ? cfg.panel_hs : cfg.gs;
+    for (int gran : granularities) {
+      if ((!cfg.panel_mode && (gran < 1 || b.rps % gran)) ||
+          (cfg.panel_mode && (gran < 1 || b.P % gran))) {
+        if (cfg.panel_mode)
+          std::fprintf(stderr, "skip H=%d: P=%d panels/row not divisible\n",
+                       gran, b.P);
+        else
+          std::fprintf(stderr,
+                       "skip G=%d: %d row-blocks/shard not divisible\n",
+                       gran, b.rps);
         continue;
       }
       for (const auto& vn : cfg.variants) {
@@ -951,30 +1129,47 @@ int main(int argc, char** argv) {
             continue;
           }
           b.var = v;
-          b.G = g;
-          b.cps = b.rps / g;
+          b.ce_panelized = cfg.panel_mode && vn == "ce-panelized";
+          b.G = cfg.panel_mode ? 1 : gran;
+          b.H = cfg.panel_mode ? gran : 0;
+          b.cpr = cfg.panel_mode ? b.P / b.H : 0;
+          b.cps = cfg.panel_mode ? b.rps * b.cpr : b.rps / b.G;
           b.n_chunks = b.world * b.cps;
           if (b.n_chunks > e4::kMaxChunks) {
-            std::fprintf(stderr, "skip G=%d: %d chunks > %d flag slots\n", g,
-                         b.n_chunks, e4::kMaxChunks);
+            std::fprintf(stderr, "skip %c=%d: %d chunks > %d flag slots\n",
+                         cfg.panel_mode ? 'H' : 'G', gran, b.n_chunks,
+                         e4::kMaxChunks);
             continue;
           }
-          b.n_comm = (v == V_TMA) ? std::min(nc, b.n_sm - 1) : 0;
-          b.n_compute = std::min(b.n_sm - b.n_comm, b.n_units);
-          b.chunk_major = (v == V_CE && cfg.comm_streams > 1) ? 1 : 0;
+          b.n_comm = (v == V_TMA)
+                         ? std::min(std::min(nc, b.n_sm - 1), b.n_jobs())
+                         : 0;
+          const int ce_reserve =
+              v == V_CE ? std::min(cfg.ce_reserve_sm, b.n_sm - 1) : 0;
+          b.n_compute =
+              std::min(b.n_sm - b.n_comm - ce_reserve, b.n_units);
+          b.chunk_major =
+              (!cfg.panel_mode && v == V_CE && cfg.comm_streams > 1) ? 1 : 0;
           b.reset_flags();
-          const size_t chunk_bytes = (size_t)g * e4::kRbRows * b.K * 2;
-          const int n_comm_eff =
-              (v == V_TMA) ? std::min(b.n_comm, b.n_jobs()) : 0;
+          const size_t chunk_bytes =
+              cfg.panel_mode ? (size_t)b.H * e4::kPanelBytes
+                             : (size_t)b.G * e4::kRbRows * b.K * 2;
+          const int n_comm_eff = (v == V_TMA) ? b.n_comm : 0;
           const int grid = b.n_comm + b.n_compute;
 
-          std::printf("--- %s K=%d G=%d chunk=%.2fMiB copies/rank=%d",
-                      kVarName[v], b.K, g, chunk_bytes / (double)(1 << 20),
-                      b.n_jobs());
+          std::printf("--- %s K=%d %c=%d chunk=%.3fMiB jobs/rank=%d",
+                      b.var_name(), b.K, cfg.panel_mode ? 'H' : 'G', gran,
+                      chunk_bytes / (double)(1 << 20), b.n_jobs());
           if (v == V_TMA)
-            std::printf(" n_comm=%d(eff %d)", b.n_comm, n_comm_eff);
+            std::printf(" panels/rank=%d n_comm=%d(eff %d)",
+                        cfg.panel_mode ? b.n_jobs() * b.H
+                                       : b.n_jobs() * b.G * b.P,
+                        b.n_comm, n_comm_eff);
           else
-            std::printf(" streams=%d", cfg.comm_streams);
+            std::printf(" copy-calls/rank=%d streams=%d ce-reserve-sm=%d",
+                        b.n_jobs() *
+                            ((cfg.panel_mode && b.ce_panelized) ? b.H : 1),
+                        cfg.comm_streams, ce_reserve);
           std::printf(" grid=%d ---\n", grid);
 
           // verify
@@ -999,7 +1194,8 @@ int main(int argc, char** argv) {
           };
           auto max_mean = [&](const ModeStats& s) {
             double m = 0;
-            for (int r = 0; r < b.world; ++r) m = std::max(m, s.st[r].mean);
+            for (int r = 0; r < b.world; ++r)
+              m = std::max(m, std::max(s.st[r].mean, s.e2e[r].mean));
             return m;
           };
 
@@ -1070,7 +1266,7 @@ int main(int argc, char** argv) {
                     for (int c = 0; c < b.n_chunks; ++c)
                       std::fprintf(da[r],
                                    "%s,%d,%d,%d,%d,%d,%d,%llu,%llu\n",
-                                   kVarName[v], b.K, g, b.n_comm, it, c,
+                                   b.var_name(), b.K, gran, b.n_comm, it, c,
                                    c / b.cps, (unsigned long long)arm,
                                    (unsigned long long)
                                        arr_log[r][(size_t)it *
@@ -1091,9 +1287,10 @@ int main(int argc, char** argv) {
             const double isd =
                 (w_byst && bus > 0) ? byst.st[r].mean / bus : 0;
             const double ssd = (sd > 0 && isd > 0) ? sd / isd : 0;
-            std::printf("  rank%d: base %.1fus", r, bus);
+            std::printf("  rank%d: base-active %.1fus", r, bus);
             if (w_fused)
-              std::printf(" fused %.1fus sd %.3f", fused.st[r].mean, sd);
+              std::printf(" fused-active %.1fus e2e %.1fus sd %.3f",
+                          fused.st[r].mean, fused.e2e[r].mean, sd);
             if (w_byst) std::printf(" interf %.3f", isd);
             if (ssd > 0) std::printf(" stall %.3f", ssd);
             if (w_fused)
@@ -1102,7 +1299,8 @@ int main(int argc, char** argv) {
 
             auto row = [&](const char* mode, const Stats& st, int iters,
                            double slowdown, double interf, double stall,
-                           double gbps, const Stats* w, unsigned errs) {
+                           double gbps, const Stats* w, unsigned errs,
+                           double e2e_mean, double host_ms) {
               if (!csv) return;
               const unsigned long long bsum =
                   cfg.verify ? (v == V_CE ? bs_ce[r] : bs_tma[r]) : 0;
@@ -1110,41 +1308,47 @@ int main(int argc, char** argv) {
                   csv,
                   "%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%d,%d,%d,%d,%d,"
                   "%d,%d,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,"
-                  "%.4f,%.2f,%.2f,%.2f,%.2f,%016llx,%u,%s\n",
-                  kVarName[v], mode, b.use_memop ? "memop" : "kernel",
+                  "%.4f,%.2f,%.2f,%.2f,%.2f,%016llx,%u,%s,%s,%d,%.2f,%.4f,%d\n",
+                  b.var_name(), mode, b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", r, b.world, b.M,
-                  cfg.n, b.K, g, b.n_chunks, chunk_bytes, b.n_comm,
+                  cfg.n, b.K, b.G, b.n_chunks, chunk_bytes, b.n_comm,
                   n_comm_eff, cfg.comm_streams, b.slices_eff, cfg.intensity,
                   grid, e4::kThreads, iters, b.epoch, st.mean, st.p50, st.p95,
                   st.mn, st.mx, bus, drift, slowdown, interf, stall, gbps,
                   w ? w->p50 : 0, w ? w->p95 : 0, w ? w->mx : 0, bsum, errs,
-                  ver);
+                  ver, cfg.panel_mode ? "panel" : "row", b.H, e2e_mean,
+                  host_ms, v == V_CE ? cfg.ce_reserve_sm : 0);
             };
             row("compute-only", base.st[r], it_b, 0, 0, 0, 0, nullptr,
-                base.err_count);
+                base.err_count, base.e2e[r].mean, base.host_ms_per_iter);
             if (w_fused)
               row("fused", fused.st[r], it_f, sd, isd, ssd, 0, &ws[r],
-                  fused.err_count);
+                  fused.err_count, fused.e2e[r].mean,
+                  fused.host_ms_per_iter);
             if (w_byst)
               row("bystander", byst.st[r], 0, 0, isd, 0, 0, nullptr,
-                  byst.err_count);
+                  byst.err_count, byst.e2e[r].mean,
+                  byst.host_ms_per_iter);
             if (w_comm && v == V_TMA) {
               const double g2 = tcomm.st[r].mean > 0
                                     ? remote_bytes /
                                           (tcomm.st[r].mean * 1e-6) / 1e9
                                     : 0;
-              row("comm-only", tcomm.st[r], 0, 0, 0, 0, g2, nullptr, 0);
+              row("comm-only", tcomm.st[r], 0, 0, 0, 0, g2, nullptr, 0,
+                  tcomm.e2e[r].mean, tcomm.host_ms_per_iter);
             }
             if (w_local)
               row("local", local.st[r], 0,
                   bus > 0 ? local.st[r].mean / bus : 0, 0, 0, 0, nullptr,
-                  local.err_count);
+                  local.err_count, local.e2e[r].mean,
+                  local.host_ms_per_iter);
             if (run_memop)
               row("memop-cost", memop.st[r], 0,
                   bus > 0 ? memop.st[r].mean / bus : 0, 0, 0, 0, nullptr,
-                  memop.err_count);
+                  memop.err_count, memop.e2e[r].mean,
+                  memop.host_ms_per_iter);
             if (w_arr) row("arrival", arr.st[r], e4::kLogIters, 0, 0, 0, 0,
-                           nullptr, 0);
+                           nullptr, 0, arr.st[r].mean, 0);
           }
           if (w_comm && v == V_CE) {
             std::printf("  comm: %.1fus %.1fGB/s/rank\n", ce_comm_us, gbps_ce);
@@ -1153,13 +1357,14 @@ int main(int argc, char** argv) {
                   csv,
                   "%s,comm-only,%s,%s,-1,%d,%d,%d,%d,%d,%d,%zu,0,0,%d,%d,%d,"
                   "%d,%d,0,%u,%.2f,%.2f,%.2f,%.2f,%.2f,0,0,0,0,0,%.2f,0,0,0,"
-                  "%016llx,0,%s\n",
-                  kVarName[v], b.use_memop ? "memop" : "kernel",
+                  "%016llx,0,%s,%s,%d,%.2f,%.4f,%d\n",
+                  b.var_name(), b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", b.world, b.M, cfg.n,
-                  b.K, g, b.n_chunks, chunk_bytes, cfg.comm_streams,
+                  b.K, b.G, b.n_chunks, chunk_bytes, cfg.comm_streams,
                   b.slices_eff, cfg.intensity, grid, e4::kThreads, b.epoch,
                   ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us,
-                  gbps_ce, 0ull, ver);
+                  gbps_ce, 0ull, ver, cfg.panel_mode ? "panel" : "row", b.H,
+                  ce_comm_us, 0.0, cfg.ce_reserve_sm);
           }
           if (w_comm && v == V_TMA) {
             double m = 0;
@@ -1175,7 +1380,7 @@ int main(int argc, char** argv) {
               lmax = std::max(lmax, local.st[r].mean / base.st[r].mean);
               mmax = std::max(mmax, memop.st[r].mean / base.st[r].mean);
             }
-            std::printf("  controls (expect ~1.00):");
+            std::printf("  controls:");
             if (w_local) std::printf(" local sd %.3f", lmax);
             if (run_memop) std::printf(" memop sd %.3f", mmax);
             std::printf("\n");
@@ -1199,9 +1404,11 @@ int main(int argc, char** argv) {
       "\nslowdown = fused/compute-only (same variant & grid). interference_sd"
       " = bystander/compute-only\n(comm running, gates pre-armed -> pure "
       "bandwidth/engine interference). stall_sd = slowdown /\ninterference_sd"
-      " = the dependency-stall component. local & memop-cost are a-priori "
-      "~1.00 controls\nfor the gating machinery. CE rows: full grid computes,"
+      " is a descriptive fused/bystander ratio, not an additive causal "
+      "decomposition.\nlocal & memop-cost are diagnostic controls. CE rows: "
+      "full grid computes,"
       " copies ride the copy engine.\nTMA rows: n_comm blocks of the same "
       "kernel pull panels via tensor-map TMA instead.\n");
+  b.stop_workers();
   return 0;
 }

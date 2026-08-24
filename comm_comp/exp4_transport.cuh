@@ -39,8 +39,10 @@ constexpr int kStages = 8;      // TMA pipeline depth: 8 x 16 KiB smem
 constexpr int kFlagStride = 32; // ints per flag -> one 128 B line each
 constexpr uint32_t kArmed = 0x7FFFFFFFu;  // "local chunk, always ready"
 constexpr int kMaxWorld = 8;
-constexpr int kMaxChunks = 64;   // world * chunks-per-shard at G=1
-constexpr int kMaxUnits = 4096;  // ts_log capacity: n_rb * slices
+// Panel-granularity supplement: at M=K=8192 on four GPUs, H=1 produces
+// 64 row-blocks * 128 panels = 8192 independently-ready chunks/units.
+constexpr int kMaxChunks = 16384;
+constexpr int kMaxUnits = 16384;
 constexpr int kLogIters = 8;     // per-tile timestamp ring depth
 
 inline size_t smem_bytes() {
@@ -255,7 +257,8 @@ inline void encode_tmap_2d(const DriverApi& drv, CUtensorMap* out, void* base,
 // ---------------------------------------------------------------------------
 
 struct TmaMaps {
-  CUtensorMap m[4];  // [0..2] = ring peers' A_src, [3] = own A_src (local mode)
+  // [0..world-2] = ring peers; last slot = own A_src for local mode.
+  CUtensorMap m[kMaxWorld];
 };
 
 struct KCfg {
@@ -263,6 +266,9 @@ struct KCfg {
   int P = 0;             // K/64 panels per row-block
   int rb_per_shard = 0;
   int G = 0, cps = 0;    // row-blocks per chunk, chunks per shard
+  int panel_mode = 0;    // 0: G row-blocks/chunk; 1: H panels/chunk
+  int H = 0;             // panels per ready flag in panel mode
+  int cpr = 0;           // chunks per row-block = P/H in panel mode
   int n_comm = 0, n_compute = 0;
   int n_units = 0, slices = 0;
   int intensity = 0;     // FMA ops per loaded 16 B vector (4 chains x I/4)
@@ -306,13 +312,17 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
       const int peer_i = j / cfg.cps;
       const int c_in = j % cfg.cps;
       const int owner = (cfg.rank + 1 + peer_i) % cfg.world;
-      const CUtensorMap* map = cfg.local_mode ? &maps.m[3] : &maps.m[peer_i];
-      const int items = cfg.G * cfg.P;  // panels in this chunk
+      const CUtensorMap* map =
+          cfg.local_mode ? &maps.m[kMaxWorld - 1] : &maps.m[peer_i];
+      const int rb0 = cfg.panel_mode ? c_in / cfg.cpr : c_in * cfg.G;
+      const int p0 = cfg.panel_mode ? (c_in % cfg.cpr) * cfg.H : 0;
+      const int items = cfg.panel_mode ? cfg.H : cfg.G * cfg.P;
 
       auto issue_load = [&](int it) {
         const uint32_t s = (uint32_t)((slot_base + (uint64_t)it) % kStages);
-        const int rb_c = it / cfg.P, p = it % cfg.P;
-        const int rb_l = c_in * cfg.G + rb_c;  // row-block within owner shard
+        const int rb_c = cfg.panel_mode ? 0 : it / cfg.P;
+        const int p = cfg.panel_mode ? p0 + it : it % cfg.P;
+        const int rb_l = rb0 + rb_c;  // row-block within owner shard
         mbarrier_arrive_expect_tx(&bar[s], kPanelBytes);
         tma_load_tensor2d(buf + (size_t)s * kPanelBytes, map, p * kPanelCols,
                           rb_l * kRbRows, &bar[s]);
@@ -325,8 +335,9 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
         const uint32_t s = (uint32_t)((slot_base + (uint64_t)d) % kStages);
         mbarrier_wait(&bar[s], (phase_bits >> s) & 1u);
         phase_bits ^= 1u << s;
-        const int rb_c = d / cfg.P, p = d % cfg.P;
-        const int rb_g = owner * cfg.rb_per_shard + c_in * cfg.G + rb_c;
+        const int rb_c = cfg.panel_mode ? 0 : d / cfg.P;
+        const int p = cfg.panel_mode ? p0 + d : d % cfg.P;
+        const int rb_g = owner * cfg.rb_per_shard + rb0 + rb_c;
         tma_store_1d(staged + blocked_off(rb_g, p, cfg.P),
                      buf + (size_t)s * kPanelBytes, kPanelBytes);
         tma_store_commit();
@@ -353,10 +364,12 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
   const int chain = cfg.intensity >> 2;
 
   for (int i = cb; i < cfg.n_units; i += cfg.n_compute) {
-    const int rb = rb_order_at(i / cfg.slices, cfg.rank, cfg.world,
+    const int unit_in_rb = cfg.panel_mode ? cfg.P : cfg.slices;
+    const int rb = rb_order_at(i / unit_in_rb, cfg.rank, cfg.world,
                                cfg.rb_per_shard, cfg.G, cfg.chunk_major);
-    const int sl = i % cfg.slices;
-    const int c = rb / cfg.G;  // global chunk id (G | rb_per_shard)
+    const int sl = i % unit_in_rb;
+    const int c = cfg.panel_mode ? rb * cfg.cpr + sl / cfg.H
+                                 : rb / cfg.G;
     uint64_t t0 = 0, t1 = 0;
     if (threadIdx.x == 0) {
       t0 = globaltimer();
@@ -370,10 +383,12 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
     }
     __syncthreads();
 
-    // stream this slice's panels: real vectorized loads + a fixed FMA chain
-    const int pp = cfg.P / cfg.slices;
+    // Row mode streams one K-slice. Panel mode streams exactly one 128x64
+    // panel, so total synthetic compute is fixed while H changes.
+    const int pp = cfg.panel_mode ? 1 : cfg.P / cfg.slices;
+    const int p_begin = cfg.panel_mode ? sl : sl * pp;
     const uint4* v4 = reinterpret_cast<const uint4*>(
-        src_blocked + blocked_off(rb, sl * pp, cfg.P));
+        src_blocked + blocked_off(rb, p_begin, cfg.P));
     const int n_vec = pp * (kPanelElems / 8);
     for (int idx = threadIdx.x; idx < n_vec; idx += kThreads) {
       const uint4 u = v4[idx];
@@ -433,14 +448,13 @@ __global__ void transform_blocked_kernel(const __half* __restrict__ src,
   }
 }
 
-// arrival mode: one thread per chunk records when its flag reaches `epoch`.
+// arrival mode: grid-stride observers record when each flag reaches `epoch`.
 // arr_log slot layout: [kMaxChunks] arrivals + [kMaxChunks] = kernel-entry t.
 __global__ void observer_kernel(const uint32_t* flags, int n_chunks,
                                 uint32_t epoch, uint64_t* arr_slot) {
-  if (threadIdx.x == 0) arr_slot[kMaxChunks] = globaltimer();
-  __syncthreads();
-  const int t = threadIdx.x;
-  if (t < n_chunks) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) arr_slot[kMaxChunks] = globaltimer();
+  for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < n_chunks;
+       t += blockDim.x * gridDim.x) {
     while (ld_acquire_sys(&flags[flag_idx(t)]) < epoch) __nanosleep(256);
     arr_slot[t] = globaltimer();
   }

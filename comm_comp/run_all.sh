@@ -178,6 +178,7 @@ if [ "$QUICK" = "1" ]; then
   MSWEEP_V1="512x8192x8192"
   MSWEEP_V2="2048"
   EXP4_K="2048,8192"; EXP4_G="1,4,16"
+  EXP4_PANEL_H="1,8,64"
 else
   WIN=200; ITERS_FUSED=300; WARM=500
   SIZES1="2048,4096,8192"; SIZES2="8192,16384x8192x8192"
@@ -190,6 +191,7 @@ else
   MSWEEP_V1="64x8192x8192,128x8192x8192,256x8192x8192,512x8192x8192,1024x8192x8192,2048x8192x8192,4096x8192x8192,16384x8192x8192,32768x8192x8192"
   MSWEEP_V2="512 1024 2048 4096 8192 16384 32768"
   EXP4_K="1024,2048,4096,8192"; EXP4_G="1,2,4,8,16"
+  EXP4_PANEL_H="1,2,4,8,16,32,64,128"
 fi
 
 # ---------------------------------------------------------------------------
@@ -355,14 +357,34 @@ run exp4_streams3 900 ./exp4_ag_tile_transport \
     --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_streams.csv"
 # cross-check rows: flag-set-kernel fallback priced against the memop path
 run exp4_flagkernel 600 ./exp4_ag_tile_transport \
-    --k 8192 --g 4 --variants ce --flag-kernel \
+    --k 8192 --g 4 --variants ce --flag-kernel --verify \
     --modes fused,compute-only,memop-cost \
     --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_flagkernel.csv"
 # robustness row: cycle the CE landing buffer to bound L2 write absorption
 run exp4_cycledst 600 ./exp4_ag_tile_transport \
-    --k 1024 --g 4 --variants ce --ce-cycle-dst \
+    --k 1024 --g 4 --variants ce --ce-cycle-dst --verify \
     --modes fused,compute-only,comm-only \
     --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_cycledst.csv"
+
+# panel supplement: fixed 128x64 fp16 (16 KiB) physical panel, H panels per
+# ready flag. CE aggregate uses one H*16 KiB copy; CE panelized uses H 16 KiB
+# copies; TMA always pipelines 16 KiB panels. Host ranks submit in parallel.
+run exp4_panel 3600 ./exp4_ag_tile_transport \
+    --k 8192 --panel-h "$EXP4_PANEL_H" --n-comm 8 --verify \
+    --modes fused,compute-only,comm-only,bystander,local,memop-cost \
+    --window-ms "$WIN" --warmup-ms "$WARM" --csv "$OUT/exp4_panel.csv"
+run exp4_panel_ce_isosm 1800 ./exp4_ag_tile_transport \
+    --k 8192 --panel-h 1,8,128 \
+    --variants ce-aggregate,ce-panelized --ce-reserve-sm 8 --verify \
+    --modes fused,compute-only,bystander,memop-cost \
+    --window-ms "$WIN" --warmup-ms "$WARM" \
+    --csv "$OUT/exp4_panel_ce_isosm.csv"
+run exp4_panel_ncomm 1800 ./exp4_ag_tile_transport \
+    --k 8192 --panel-h 1,8,128 --variants tma \
+    --n-comm 1,2,4,8,16 --verify \
+    --modes fused,compute-only,comm-only,bystander \
+    --window-ms "$WIN" --warmup-ms "$WARM" \
+    --csv "$OUT/exp4_panel_ncomm.csv"
 
 # ---------------------------------------------------------------------------
 # wrap up

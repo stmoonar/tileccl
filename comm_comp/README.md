@@ -253,14 +253,19 @@ K 干净地暴露 CE 每拷贝固定开销的摊销）、`--n-comm`（仅 TMA）
 | `fused` | 真实依赖 + 真实搬运 | 主行 |
 | `comm-only` | 只搬运：CE 墙钟（rank=-1 聚合行）/ TMA 事件计时 | 带宽 |
 | `bystander` | 搬运照跑但门控直通 → 纯带宽/引擎干扰分量（挂钩 exp1） | 干扰 |
-| `local` | 同卡搬运 + 真实门控 | ≈1.00（对照） |
-| `memop-cost` | 仅 CE：纯 write-value 链 + 真实门控 | ≈1.00（对照） |
+| `local` | 同卡搬运 + 真实门控 | 诊断本地 HBM + 门控成本，不预设 ≈1 |
+| `memop-cost` | 仅 CE：纯 write-value 链 + 真实门控 | 诊断 flag 提交成本，不预设 ≈1 |
 | `arrival` | 搬运 + observer kernel 记每 chunk 到达时刻（无计算干扰） | 到达曲线 |
 
-归因：`slowdown = fused/compute-only`，`interference_sd =
-bystander/compute-only`，`stall_sd = slowdown/interference_sd`（依赖停顿
-分量）。fused 行自带 remote 单元等待时间的 p50/p95/max（kernel 内
-`%globaltimer` 时间戳，只做同卡差值；启动时打印跨卡偏移作证据）。
+描述指标：`slowdown = fused/compute-only`，`interference_sd =
+bystander/compute-only`，`stall_sd = slowdown/interference_sd`。最后一个比值
+只用于描述，不能当作可加的因果分解。fused 行自带 remote 单元等待时间的
+p50/p95/max（kernel 内 `%globaltimer` 时间戳，只做同卡差值）。
+
+新结果中 `t_us_*` 是 consumer kernel 的 active 时间（含设备端自旋，不含
+kernel 提交前的宿主空档）；`e2e_us_mean` 是相邻迭代完成点之间的端到端时间，
+`host_enqueue_ms` 单列宿主提交/反压。三者必须同时报告，不能把宿主提交慢
+直接归因成 HBM 干扰。
 
 ```bash
 make exp4_ag_tile_transport
@@ -276,6 +281,49 @@ blob 与 peer 分片逐位一致；(d) CE/TMA 两变体计算校验和逐位相�
 整数 wrapping add，网格划分无关）；(e) 消费者读到的 epoch 断言
 （`err_count` 列）。CSV 每行带 `flag_mech`（memop/kernel fallback，绝不
 静默混行）与 `ce_dst`（fixed/`--ce-cycle-dst`）。
+
+### Exp4 补充：16 KiB panel 粒度 CE/TMA 对照
+
+`--panel-h` 切换到物理 panel 实验。最小单元固定为 A 的
+`128×64×fp16 = 16 KiB`；H 表示多少个连续 panel 共用一个 ready flag。
+固定 K 时，总 AG 字节数与总合成计算量不随 H 改变：
+
+- `ce-aggregate`：每个 chunk 发一次 `H×16 KiB` 连续 dummy copy，再发 flag；
+- `ce-panelized`：每个 chunk 连续发 H 次 16 KiB dummy copy，再发 flag；
+- `tma`：H 次真实 `128×64` peer TMA load → local HBM store，再发 flag，
+  consumer 读取真正搬到的 panel。
+
+三者的字节数、flag 粒度和 consumer 工作完全相同。CE consumer 按实验定义
+读取预变换 shadow。宿主默认使用每 GPU 一个持久 worker 并行提交，模拟 Flux
+一进程一卡；`--serial-host` 仅用于复现/诊断旧的四 rank 串行提交偏差。
+
+```bash
+# 快速正确性检查
+./exp4_ag_tile_transport --k 1024 --panel-h 1,4,16 --n-comm 4 \
+    --iters 5 --verify --modes fused,compute-only,comm-only
+
+# 正式 H sweep：16 KiB -- 2 MiB/flag，总字节数固定
+./exp4_ag_tile_transport --k 8192 \
+    --panel-h 1,2,4,8,16,32,64,128 --n-comm 8 --verify \
+    --modes fused,compute-only,comm-only,bystander,local,memop-cost \
+    --warmup-ms 500 --window-ms 200 --csv exp4_panel.csv
+
+# 等 SM 对照：CE 也空出与 n_comm=8 相同的 8 个 compute block
+./exp4_ag_tile_transport --k 8192 --panel-h 1,8,128 \
+    --variants ce-aggregate,ce-panelized --ce-reserve-sm 8 --verify \
+    --modes fused,compute-only,bystander,memop-cost \
+    --warmup-ms 500 --window-ms 200 --csv exp4_panel_ce_isosm.csv
+
+# TMA 通信 SM 数校准
+./exp4_ag_tile_transport --k 8192 --panel-h 1,8,128 --variants tma \
+    --n-comm 1,2,4,8,16 --verify \
+    --modes fused,compute-only,comm-only,bystander \
+    --warmup-ms 500 --window-ms 200 --csv exp4_panel_ncomm.csv
+```
+
+panel 模式下 CSV 仍令 `g_rb=1`，并新增末尾列 `axis=panel` 与 `panel_h=H`；
+`chunk_bytes=H×16384` 是实际每 flag 字节数。TMA 使用的通信 block 数自动截断
+到实际 job 数，避免大 H 时为空闲 comm block 永久挤掉 compute block。
 
 ## 实现备注（对照 flux / CUDA 12.9）
 

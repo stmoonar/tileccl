@@ -43,7 +43,7 @@ exp3_gemm_rs_fused: exp3_gemm_rs_fused.cu common.cuh gemm_sm90.cuh \
 # API (cuStreamWriteValue32 / cuTensorMapEncodeTiled) is resolved at runtime
 # via cudaGetDriverEntryPoint, so no -lcuda here.
 exp4_ag_tile_transport: exp4_ag_tile_transport.cu common.cuh exp4_transport.cuh
-	$(NVCC) $(NVCCFLAGS) -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread -o $@ $<
 
 clean:
 	rm -f $(TARGETS) $(addsuffix .exe,$(TARGETS))
