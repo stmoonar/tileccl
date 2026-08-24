@@ -2,19 +2,26 @@
 
 # Standalone Exp4 panel-granularity runner. Deliberately does not enable
 # `set -e`: a failed build/case is recorded and existing results are packaged.
-# GPU clocks must already be configured by the host environment.
+# GPU clocks are locked without privilege escalation. A lock/hold failure skips
+# the formal cases but still packages diagnostics and never exits the shell.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if ! cd "$SCRIPT_DIR"; then
   echo "cannot enter $SCRIPT_DIR"
 else
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+EXP4_GPU_IDS=${EXP4_GPU_IDS:-0,1,2,3}
+EXP4_CLOCK_MHZ=${EXP4_CLOCK_MHZ:-1300}
+EXP4_CLOCK_TOLERANCE_MHZ=${EXP4_CLOCK_TOLERANCE_MHZ:-15}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$EXP4_GPU_IDS}
 
 STAMP=$(date -u +%Y%m%d_%H%M%S)
 OUT="exp4_panel_${STAMP}"
 FAILED=0
 SAMPLER_PID=""
+CLOCKS_LOCKED=0
+CLOCK_VALID=0
+LAST_CASE_RC=0
 
 mkdir -p "$OUT"
 
@@ -36,6 +43,7 @@ run_case() {
   fi
 
   echo "$RC" > "$OUT/${NAME}.exitcode"
+  LAST_CASE_RC=$RC
   if [ "$RC" -ne 0 ]; then
     echo "!! $NAME failed: rc=$RC"
     FAILED=1
@@ -53,7 +61,83 @@ stop_sampler() {
   fi
 }
 
-trap 'stop_sampler' INT TERM
+restore_clocks() {
+  if [ "$CLOCKS_LOCKED" -eq 1 ]; then
+    nvidia-smi -rgc -i "$EXP4_GPU_IDS" \
+      > "$OUT/clock_restore.log" 2>&1
+    RESTORE_RC=$?
+    echo "$RESTORE_RC" > "$OUT/clock_restore.exitcode"
+    CLOCKS_LOCKED=0
+    if [ "$RESTORE_RC" -ne 0 ]; then
+      echo "!! clock restore failed: rc=$RESTORE_RC"
+      FAILED=1
+    fi
+  fi
+}
+
+lock_clocks() {
+  echo "=== lock clocks: ${EXP4_CLOCK_MHZ} MHz on ${EXP4_GPU_IDS} ==="
+  nvidia-smi -lgc "$EXP4_CLOCK_MHZ" -i "$EXP4_GPU_IDS" \
+    > "$OUT/clock_lock.log" 2>&1
+  LOCK_RC=$?
+  echo "$LOCK_RC" > "$OUT/clock_lock.exitcode"
+  if [ "$LOCK_RC" -ne 0 ]; then
+    echo "!! clock lock failed: rc=$LOCK_RC"
+    FAILED=1
+    CLOCK_VALID=0
+    return 0
+  fi
+
+  CLOCKS_LOCKED=1
+  nvidia-smi -i "$EXP4_GPU_IDS" \
+    --query-gpu=index,clocks.sm,clocks.max.sm,power.draw,temperature.gpu \
+    --format=csv > "$OUT/clocks_locked.csv" 2>&1
+
+  BAD_CLOCKS=$(nvidia-smi -i "$EXP4_GPU_IDS" \
+    --query-gpu=clocks.sm --format=csv,noheader,nounits 2>/dev/null |
+    awk -v target="$EXP4_CLOCK_MHZ" -v tol="$EXP4_CLOCK_TOLERANCE_MHZ" '
+      { d = $1 - target; if (d < 0) d = -d; if (d > tol) bad++ }
+      END { print bad + 0 }
+    ')
+  if [ "${BAD_CLOCKS:-1}" -ne 0 ]; then
+    echo "!! requested clock is not held at idle"
+    FAILED=1
+    CLOCK_VALID=0
+  else
+    CLOCK_VALID=1
+  fi
+  return 0
+}
+
+validate_active_clocks() {
+  ACTIVE_CHECK=$(awk -F, \
+    -v target="$EXP4_CLOCK_MHZ" \
+    -v tol="$EXP4_CLOCK_TOLERANCE_MHZ" '
+      NR > 1 {
+        clk = $3 + 0; util = $6 + 0;
+        if (util >= 50) {
+          active++;
+          d = clk - target; if (d < 0) d = -d;
+          if (d > tol) bad++;
+        }
+      }
+      END { print active + 0, bad + 0 }
+    ' "$OUT/gpu_trace.csv")
+  ACTIVE_SAMPLES=${ACTIVE_CHECK%% *}
+  BAD_ACTIVE_SAMPLES=${ACTIVE_CHECK##* }
+  echo "active clock samples: $ACTIVE_SAMPLES; out of tolerance: $BAD_ACTIVE_SAMPLES" \
+    | tee "$OUT/clock_hold_check.txt"
+  if [ "$ACTIVE_SAMPLES" -eq 0 ] || [ "$BAD_ACTIVE_SAMPLES" -ne 0 ]; then
+    echo "!! clock did not hold under load"
+    FAILED=1
+    CLOCK_VALID=0
+  else
+    CLOCK_VALID=1
+  fi
+  return 0
+}
+
+trap 'stop_sampler; restore_clocks' INT TERM
 
 {
   date -u
@@ -64,7 +148,7 @@ trap 'stop_sampler' INT TERM
   nvidia-smi topo -m
 } > "$OUT/env.txt" 2>&1
 
-nvidia-smi \
+nvidia-smi -i "$EXP4_GPU_IDS" \
   --query-gpu=index,clocks.sm,clocks.max.sm,power.draw,temperature.gpu \
   --format=csv > "$OUT/clocks_before.csv" 2>&1
 
@@ -77,75 +161,91 @@ if [ "$BUILD_RC" -ne 0 ]; then
   echo "!! build failed: rc=$BUILD_RC"
   FAILED=1
 else
-  printf 'timestamp,index,clocks_sm,power_w,temp_c,util_pct\n' \
-    > "$OUT/gpu_trace.csv"
+  lock_clocks
+  if [ "$CLOCK_VALID" -ne 1 ]; then
+    echo "!! formal experiments skipped because clock lock failed"
+  else
+    printf 'timestamp,index,clocks_sm,power_w,temp_c,util_pct\n' \
+      > "$OUT/gpu_trace.csv"
 
-  (
-    while true; do
-      TS=$(date +%s.%N)
-      nvidia-smi \
-        --query-gpu=index,clocks.sm,power.draw,temperature.gpu,utilization.gpu \
-        --format=csv,noheader,nounits 2>/dev/null |
-        sed "s/^/${TS},/"
-      sleep 0.1
-    done
-  ) >> "$OUT/gpu_trace.csv" &
-  SAMPLER_PID=$!
+    (
+      while true; do
+        TS=$(date +%s.%N)
+        nvidia-smi -i "$EXP4_GPU_IDS" \
+          --query-gpu=index,clocks.sm,power.draw,temperature.gpu,utilization.gpu \
+          --format=csv,noheader,nounits 2>/dev/null |
+          sed "s/^/${TS},/"
+        sleep 0.1
+      done
+    ) >> "$OUT/gpu_trace.csv" &
+    SAMPLER_PID=$!
 
-  run_case exp4_panel_verify 900 \
-    ./exp4_ag_tile_transport \
-    --ndev 4 \
-    --k 1024 \
-    --panel-h 1,4,16 \
-    --n-comm 4 \
-    --iters 5 \
-    --verify \
-    --modes fused,compute-only,comm-only
+    run_case exp4_panel_verify 900 \
+      ./exp4_ag_tile_transport \
+      --ndev 4 \
+      --k 1024 \
+      --panel-h 1,4,16 \
+      --n-comm 4 \
+      --iters 5 \
+      --verify \
+      --modes fused,compute-only,comm-only
 
-  run_case exp4_panel 7200 \
-    ./exp4_ag_tile_transport \
-    --ndev 4 \
-    --k 8192 \
-    --panel-h 1,2,4,8,16,32,64,128 \
-    --n-comm 8 \
-    --verify \
-    --modes fused,compute-only,comm-only,bystander,local,memop-cost \
-    --warmup-ms 500 \
-    --window-ms 200 \
-    --csv "$OUT/exp4_panel.csv"
+    validate_active_clocks
+    if [ "$LAST_CASE_RC" -ne 0 ] || [ "$CLOCK_VALID" -ne 1 ]; then
+      echo "!! formal experiments skipped after verify/clock-hold failure"
+    else
+      run_case exp4_panel 7200 \
+        ./exp4_ag_tile_transport \
+        --ndev 4 \
+        --k 8192 \
+        --panel-h 1,2,4,8,16,32,64,128 \
+        --n-comm 8 \
+        --verify \
+        --modes fused,compute-only,comm-only,bystander,local,memop-cost \
+        --warmup-ms 500 \
+        --window-ms 200 \
+        --csv "$OUT/exp4_panel.csv"
 
-  run_case exp4_panel_ce_isosm 3600 \
-    ./exp4_ag_tile_transport \
-    --ndev 4 \
-    --k 8192 \
-    --panel-h 1,8,128 \
-    --variants ce-aggregate,ce-panelized \
-    --ce-reserve-sm 8 \
-    --verify \
-    --modes fused,compute-only,bystander,memop-cost \
-    --warmup-ms 500 \
-    --window-ms 200 \
-    --csv "$OUT/exp4_panel_ce_isosm.csv"
+      run_case exp4_panel_ce_isosm 3600 \
+        ./exp4_ag_tile_transport \
+        --ndev 4 \
+        --k 8192 \
+        --panel-h 1,8,128 \
+        --variants ce-aggregate,ce-panelized \
+        --ce-reserve-sm 8 \
+        --verify \
+        --modes fused,compute-only,bystander,memop-cost \
+        --warmup-ms 500 \
+        --window-ms 200 \
+        --csv "$OUT/exp4_panel_ce_isosm.csv"
 
-  run_case exp4_panel_ncomm 3600 \
-    ./exp4_ag_tile_transport \
-    --ndev 4 \
-    --k 8192 \
-    --panel-h 1,8,128 \
-    --variants tma \
-    --n-comm 1,2,4,8,16 \
-    --verify \
-    --modes fused,compute-only,comm-only,bystander \
-    --warmup-ms 500 \
-    --window-ms 200 \
-    --csv "$OUT/exp4_panel_ncomm.csv"
+      run_case exp4_panel_ncomm 3600 \
+        ./exp4_ag_tile_transport \
+        --ndev 4 \
+        --k 8192 \
+        --panel-h 1,8,128 \
+        --variants tma \
+        --n-comm 1,2,4,8,16 \
+        --verify \
+        --modes fused,compute-only,comm-only,bystander \
+        --warmup-ms 500 \
+        --window-ms 200 \
+        --csv "$OUT/exp4_panel_ncomm.csv"
 
-  stop_sampler
+      validate_active_clocks
+    fi
+    stop_sampler
+  fi
 fi
 
-nvidia-smi \
+nvidia-smi -i "$EXP4_GPU_IDS" \
   --query-gpu=index,clocks.sm,clocks.max.sm,power.draw,temperature.gpu \
   --format=csv > "$OUT/clocks_after.csv" 2>&1
+
+restore_clocks
+nvidia-smi -i "$EXP4_GPU_IDS" \
+  --query-gpu=index,clocks.sm,clocks.max.sm,power.draw,temperature.gpu \
+  --format=csv > "$OUT/clocks_restored.csv" 2>&1
 
 cp \
   exp4_ag_tile_transport.cu \
