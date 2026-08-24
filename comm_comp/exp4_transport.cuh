@@ -39,10 +39,11 @@ constexpr int kStages = 8;      // TMA pipeline depth: 8 x 16 KiB smem
 constexpr int kFlagStride = 32; // ints per flag -> one 128 B line each
 constexpr uint32_t kArmed = 0x7FFFFFFFu;  // "local chunk, always ready"
 constexpr int kMaxWorld = 8;
-// Panel-granularity supplement: at M=K=8192 on four GPUs, H=1 produces
-// 64 row-blocks * 128 panels = 8192 independently-ready chunks/units.
-constexpr int kMaxChunks = 16384;
-constexpr int kMaxUnits = 16384;
+// Extended panel sweep: M=32768, K=8192 on four GPUs gives 8192 panels/shard
+// and 32768 compute units / flag slots at H=1.  This permits H=8192, i.e.
+// one 128-MiB ready group per peer shard.
+constexpr int kMaxChunks = 32768;
+constexpr int kMaxUnits = 32768;
 constexpr int kLogIters = 8;     // per-tile timestamp ring depth
 
 inline size_t smem_bytes() {
@@ -114,6 +115,16 @@ __device__ __forceinline__ void st_release_sys(uint32_t* p, uint32_t v) {
 __device__ __forceinline__ void st_release_gpu(uint32_t* p, uint32_t v) {
   asm volatile("st.release.gpu.global.u32 [%0], %1;" : : "l"(p), "r"(v)
                : "memory");
+}
+
+__device__ __forceinline__ uint32_t atomic_add_acq_rel_gpu(uint32_t* p,
+                                                            uint32_t v) {
+  uint32_t old;
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+               : "=r"(old)
+               : "l"(p), "r"(v)
+               : "memory");
+  return old;
 }
 
 __device__ __forceinline__ uint32_t ld_acquire_flag(const uint32_t* p,
@@ -302,8 +313,7 @@ struct KCfg {
   int rb_per_shard = 0;
   int G = 0, cps = 0;    // row-blocks per chunk, chunks per shard
   int panel_mode = 0;    // 0: G row-blocks/chunk; 1: H panels/chunk
-  int H = 0;             // panels per ready flag in panel mode
-  int cpr = 0;           // chunks per row-block = P/H in panel mode
+  int H = 0;             // shard-linear panels per ready flag in panel mode
   int n_comm = 0, n_compute = 0;
   int n_units = 0, slices = 0;
   int intensity = 0;     // FMA ops per loaded 16 B vector (4 chains x I/4)
@@ -336,7 +346,8 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
     __half* __restrict__ staged,             // TMA comm store target
     uint32_t* flags, uint64_t* ts_log, float* sink,
     unsigned long long* bitsum, unsigned* err, BlockTiming* block_timing,
-    uint32_t* grid_arrivals, uint32_t* grid_ready) {
+    uint32_t* grid_arrivals, uint32_t* grid_ready,
+    uint32_t* chunk_done) {
   BlockTiming* my_timing = nullptr;
   if (cfg.timing_slot >= 0) {
     my_timing = block_timing +
@@ -383,20 +394,26 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
     uint64_t slot_base = 0;   // monotonic stage counter across chunks
     uint32_t phase_bits = 0;  // bit s = expected parity of bar[s]
 
-    for (int j = blockIdx.x; j < n_jobs; j += cfg.n_comm) {
+    auto process_job = [&](int j, int panel_lane, int panel_stride,
+                           int workers_for_job) {
       const int peer_i = j / cfg.cps;
       const int c_in = j % cfg.cps;
       const int owner = (cfg.rank + 1 + peer_i) % cfg.world;
       const CUtensorMap* map =
           cfg.local_mode ? &maps.m[kMaxWorld - 1] : &maps.m[peer_i];
-      const int rb0 = cfg.panel_mode ? c_in / cfg.cpr : c_in * cfg.G;
-      const int p0 = cfg.panel_mode ? (c_in % cfg.cpr) * cfg.H : 0;
-      const int items = cfg.panel_mode ? cfg.H : cfg.G * cfg.P;
+      const int rb0 = cfg.panel_mode ? 0 : c_in * cfg.G;
+      const int items = cfg.panel_mode
+                            ? (cfg.H - panel_lane + panel_stride - 1) /
+                                  panel_stride
+                            : cfg.G * cfg.P;
 
       auto issue_load = [&](int it) {
         const uint32_t s = (uint32_t)((slot_base + (uint64_t)it) % kStages);
-        const int rb_c = cfg.panel_mode ? 0 : it / cfg.P;
-        const int p = cfg.panel_mode ? p0 + it : it % cfg.P;
+        const int panel_in_chunk = panel_lane + it * panel_stride;
+        const int flat_panel =
+            cfg.panel_mode ? c_in * cfg.H + panel_in_chunk : it;
+        const int rb_c = flat_panel / cfg.P;
+        const int p = flat_panel % cfg.P;
         const int rb_l = rb0 + rb_c;  // row-block within owner shard
         mbarrier_arrive_expect_tx(&bar[s], kPanelBytes);
         tma_load_tensor2d(buf + (size_t)s * kPanelBytes, map, p * kPanelCols,
@@ -410,8 +427,11 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
         const uint32_t s = (uint32_t)((slot_base + (uint64_t)d) % kStages);
         mbarrier_wait(&bar[s], (phase_bits >> s) & 1u);
         phase_bits ^= 1u << s;
-        const int rb_c = cfg.panel_mode ? 0 : d / cfg.P;
-        const int p = cfg.panel_mode ? p0 + d : d % cfg.P;
+        const int panel_in_chunk = panel_lane + d * panel_stride;
+        const int flat_panel =
+            cfg.panel_mode ? c_in * cfg.H + panel_in_chunk : d;
+        const int rb_c = flat_panel / cfg.P;
+        const int p = flat_panel % cfg.P;
         const int rb_g = owner * cfg.rb_per_shard + rb0 + rb_c;
         tma_store_1d(staged + blocked_off(rb_g, p, cfg.P),
                      buf + (size_t)s * kPanelBytes, kPanelBytes);
@@ -425,7 +445,32 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
       slot_base += items;
       // the flag says "data is IN HBM", so wait end-to-end, not just .read
       tma_store_wait_all<0>();
-      st_release_gpu(&flags[flag_idx(owner * cfg.cps + c_in)], cfg.epoch);
+      const int chunk = owner * cfg.cps + c_in;
+      if (workers_for_job == 1) {
+        st_release_gpu(&flags[flag_idx(chunk)], cfg.epoch);
+      } else {
+        // acq_rel RMWs form a release sequence across the workers.  The last
+        // worker has therefore observed every peer-panel store completion
+        // before it publishes the single chunk-ready flag.
+        const uint32_t old = atomic_add_acq_rel_gpu(&chunk_done[chunk], 1u);
+        if (old + 1u == (uint32_t)workers_for_job)
+          st_release_gpu(&flags[flag_idx(chunk)], cfg.epoch);
+      }
+    };
+
+    if (cfg.panel_mode && cfg.H >= cfg.n_comm &&
+        n_jobs % cfg.n_comm != 0) {
+      // Coarse ready groups may not divide evenly across communication SMs.
+      // Every communication block takes a strided slice of every job.  This
+      // avoids both a 2-vs-1 job imbalance at 32 MiB and an 8-block / 3-peer
+      // imbalance at 128 MiB.
+      const int active_workers = cfg.n_comm < cfg.H ? cfg.n_comm : cfg.H;
+      if ((int)blockIdx.x < active_workers)
+        for (int j = 0; j < n_jobs; ++j)
+          process_job(j, blockIdx.x, cfg.n_comm, active_workers);
+    } else {
+      for (int j = blockIdx.x; j < n_jobs; j += cfg.n_comm)
+        process_job(j, 0, 1, 1);
     }
     if (my_timing) my_timing->done_ns = globaltimer();
     return;  // exit when the job list is exhausted (no block migrates onto
@@ -444,7 +489,7 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
     const int rb = rb_order_at(i / unit_in_rb, cfg.rank, cfg.world,
                                cfg.rb_per_shard, cfg.G, cfg.chunk_major);
     const int sl = i % unit_in_rb;
-    const int c = cfg.panel_mode ? rb * cfg.cpr + sl / cfg.H
+    const int c = cfg.panel_mode ? (rb * cfg.P + sl) / cfg.H
                                  : rb / cfg.G;
     uint64_t t0 = 0, t1 = 0;
     if (threadIdx.x == 0) {
@@ -548,5 +593,16 @@ __global__ void flag_set_kernel(uint32_t* flag, uint32_t v) {
 }
 
 __global__ void timer_probe_kernel(uint64_t* out) { *out = globaltimer(); }
+
+__global__ void compare_u4_kernel(const uint4* a, const uint4* b, size_t n,
+                                  unsigned* mismatches) {
+  bool bad = false;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)gridDim.x * blockDim.x) {
+    const uint4 x = a[i], y = b[i];
+    bad |= x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w;
+  }
+  if (bad) atomicAdd(mismatches, 1u);
+}
 
 }  // namespace e4

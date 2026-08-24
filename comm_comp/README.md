@@ -285,7 +285,9 @@ blob 与 peer 分片逐位一致；(d) CE/TMA 两变体计算校验和逐位相�
 ### Exp4 补充：16 KiB panel 粒度 CE/TMA 对照
 
 `--panel-h` 切换到物理 panel 实验。最小单元固定为 A 的
-`128×64×fp16 = 16 KiB`；H 表示多少个连续 panel 共用一个 ready flag。
+`128×64×fp16 = 16 KiB`；H 表示 peer shard 的 tile-blocked 线性顺序中多少个
+连续 panel 共用一个 ready flag。H 可以跨越 128×K row-block 边界，但不会跨
+peer shard 边界。
 固定 K 时，总 AG 字节数与总合成计算量不随 H 改变：
 
 - `ce-aggregate`：每个 chunk 发一次 `H×16 KiB` 连续 dummy copy，再发 flag；
@@ -311,7 +313,9 @@ copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前�
     --modes fused,compute-only,comm-only,bystander,local,memop-cost \
     --warmup-ms 500 --window-ms 200 --csv exp4_panel.csv
 
-# 当前最小主实验：只生成 Fig2 左图所需的 fused/compute-only slowdown
+# 当前最小主实验：只生成 Fig2 左图所需的 fused/compute-only slowdown。
+# M=32768、K=8192 时每个 peer shard 是 128 MiB，H 从 1 扫到 8192，
+# 即 16 KiB--128 MiB/flag；总字节数和计算量在 sweep 内保持不变。
 # （脚本含 1300 MHz 锁频、负载持频检查、verify 和结果打包）
 ./run_exp4_panel.sh
 
@@ -329,8 +333,13 @@ copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前�
 ```
 
 panel 模式下 CSV 仍令 `g_rb=1`，并新增末尾列 `axis=panel` 与 `panel_h=H`；
-`chunk_bytes=H×16384` 是实际每 flag 字节数。TMA 使用的通信 block 数自动截断
-到实际 job 数，避免大 H 时为空闲 comm block 永久挤掉 compute block。
+`chunk_bytes=H×16384` 是实际每 flag 字节数；H 必须整除每 shard 的 panel 总数。
+粗粒度 panel job 不能被 `n_comm` 整除时，全部通信 block 会按 stride 共同搬运
+每个大 chunk，最后一个完成者才发布唯一 flag；因此 32--128 MiB 点不会出现
+job 数不均衡，也不会把 128 MiB 的 TMA 静默降成 3 个 SM。row 模式仍把通信
+block 截断到实际 job 数。
+128 MiB 点需要 `M=32768,K=8192`，主要 device buffer 合计约 1.5 GiB/GPU；
+实验只检验 CE/TMA 是否出现 crossover，不预设 CE 必然超过。
 
 Fig2 左图的 `t_us_*`/`slowdown` 不使用 kernel 尾部 CUDA event：同一 kernel 的
 event 必须等待通信和计算 block 全部退出，无法表示计算角色完成。每个 persistent

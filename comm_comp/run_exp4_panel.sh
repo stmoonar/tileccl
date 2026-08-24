@@ -185,7 +185,7 @@ else
       ./exp4_ag_tile_transport \
       --ndev 4 \
       --k 1024 \
-      --panel-h 1,4,16 \
+      --panel-h 1,16,64,256 \
       --n-comm 4 \
       --iters 5 \
       --verify \
@@ -198,13 +198,14 @@ else
       run_case exp4_fig2_left 7200 \
         ./exp4_ag_tile_transport \
         --ndev 4 \
+        --m 32768 \
         --k 8192 \
-        --panel-h 1,2,4,8,16,32,64,128 \
+        --panel-h 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192 \
         --n-comm 8 \
         --verify \
         --modes fused,compute-only \
         --warmup-ms 500 \
-        --window-ms 1000 \
+        --window-ms 5000 \
         --csv "$OUT/exp4_fig2_left.csv"
 
       validate_active_clocks

@@ -49,7 +49,12 @@ def main():
         .agg(slowdown=("slowdown", "max"))
         .sort_values(["variant", "panel_h"])
     )
-    expected = {(variant, h) for variant in LABELS for h in range(1, 129) if h & (h - 1) == 0}
+    expected = {
+        (variant, h)
+        for variant in LABELS
+        for h in range(1, 8193)
+        if h & (h - 1) == 0
+    }
     observed = set(zip(fused["variant"], fused["panel_h"]))
     if observed != expected:
         raise SystemExit(f"missing/unexpected sweep points: {sorted(expected ^ observed)}")
@@ -66,7 +71,7 @@ def main():
             "axes.spines.right": False,
         }
     )
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    fig, ax = plt.subplots(figsize=(8.2, 4.2))
     for variant in LABELS:
         rows = fused[fused["variant"] == variant]
         ax.plot(
@@ -80,10 +85,14 @@ def main():
     ax.axhline(1.0, color="black", linestyle="--", linewidth=1)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
-    ticks = [16, 32, 64, 128, 256, 512, 1024, 2048]
+    ticks = [16 * (1 << power) for power in range(14)]
     ax.set_xticks(ticks)
-    ax.set_xticklabels([str(x) for x in ticks])
-    ax.set_xlabel("Bytes per ready flag (KiB)")
+    ax.set_xticklabels(
+        [str(x) if x < 1024 else f"{x // 1024}M" for x in ticks],
+        rotation=35,
+        ha="right",
+    )
+    ax.set_xlabel("Bytes per ready flag (KiB below 1 MiB, then MiB)")
     ax.set_ylabel("Fused compute completion / compute-only")
     ax.set_title("Dependent-compute slowdown (worst rank)")
     ax.legend(frameon=False)

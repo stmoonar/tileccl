@@ -241,12 +241,29 @@ static Config parse_args(int argc, char** argv) {
   return c;
 }
 
-// bitwise compare of two device buffers via host (exp2's device_equal)
-static bool device_equal(const void* a, const void* b, size_t bytes) {
-  std::vector<uint8_t> ha(bytes), hb(bytes);
-  CUDA_CHECK(cudaMemcpy(ha.data(), a, bytes, cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(hb.data(), b, bytes, cudaMemcpyDeviceToHost));
-  return std::memcmp(ha.data(), hb.data(), bytes) == 0;
+// Bitwise compare on the receiving GPU.  At the 128-MiB endpoint the older
+// host-vector comparison allocated and transferred multiple GiB per verify.
+static bool device_equal(int device, const void* a, const void* b,
+                         size_t bytes) {
+  if (bytes % sizeof(uint4)) {
+    std::fprintf(stderr, "device_equal requires uint4-aligned byte count\n");
+    std::exit(1);
+  }
+  CUDA_CHECK(cudaSetDevice(device));
+  unsigned* d_bad = nullptr;
+  unsigned h_bad = 0;
+  CUDA_CHECK(cudaMalloc(&d_bad, sizeof(unsigned)));
+  CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(unsigned)));
+  const size_t n = bytes / sizeof(uint4);
+  const int blocks = (int)std::max<size_t>(
+      1, std::min<size_t>(4096, (n + 255) / 256));
+  e4::compare_u4_kernel<<<blocks, 256>>>(
+      static_cast<const uint4*>(a), static_cast<const uint4*>(b), n, d_bad);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(
+      cudaMemcpy(&h_bad, d_bad, sizeof(unsigned), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaFree(d_bad));
+  return h_bad == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +278,7 @@ struct RankBuf {
   uint32_t* flags = nullptr;
   uint32_t* grid_arrivals = nullptr;
   uint32_t* grid_ready = nullptr;
+  uint32_t* chunk_done = nullptr;
   uint64_t* ts_log = nullptr;
   uint64_t* arr_log = nullptr;
   e4::BlockTiming* block_timing = nullptr;
@@ -308,7 +326,7 @@ struct Bench {
 
   // per-config
   Variant var = V_CE;
-  int G = 1, H = 0, cpr = 0, cps = 0, n_chunks = 0;
+  int G = 1, H = 0, cps = 0, n_chunks = 0;
   int n_comm = 0, n_compute = 0;
   int ce_reserve_eff = 0;
   bool ce_panelized = false;
@@ -436,6 +454,8 @@ struct Bench {
                             (size_t)e4::kMaxChunks * e4::kFlagStride * 4));
       CUDA_CHECK(cudaMalloc(&b.grid_arrivals, sizeof(uint32_t)));
       CUDA_CHECK(cudaMalloc(&b.grid_ready, sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&b.chunk_done,
+                            (size_t)e4::kMaxChunks * sizeof(uint32_t)));
       CUDA_CHECK(cudaMemset(b.grid_arrivals, 0, sizeof(uint32_t)));
       CUDA_CHECK(cudaMemset(b.grid_ready, 0, sizeof(uint32_t)));
       CUDA_CHECK(cudaMalloc(&b.ts_log, (size_t)e4::kLogIters * e4::kMaxUnits *
@@ -637,7 +657,6 @@ struct Bench {
     kc.cps = cps;
     kc.panel_mode = cfg.panel_mode ? 1 : 0;
     kc.H = H;
-    kc.cpr = cpr;
     kc.n_comm = (var == V_TMA) ? n_comm : 0;
     kc.n_compute = (mode == M_COMMONLY || mode == M_ARRIVAL) ? 0 : n_compute;
     kc.n_units = n_units;
@@ -658,6 +677,9 @@ struct Bench {
     CUDA_CHECK(cudaSetDevice(r));
     CUDA_CHECK(cudaMemsetAsync(R[r].grid_arrivals, 0, sizeof(uint32_t),
                                R[r].compute));
+    CUDA_CHECK(cudaMemsetAsync(R[r].chunk_done, 0,
+                               (size_t)n_chunks * sizeof(uint32_t),
+                               R[r].compute));
     const __half* src = var == V_CE ? R[r].A_shadow : R[r].A_staged;
     __half* staged = R[r].A_staged;
     uint32_t* flags = R[r].flags;
@@ -668,9 +690,10 @@ struct Bench {
     e4::BlockTiming* block_timing = R[r].block_timing;
     uint32_t* grid_arrivals = R[r].grid_arrivals;
     uint32_t* grid_ready = R[r].grid_ready;
+    uint32_t* chunk_done = R[r].chunk_done;
     void* args[] = {&R[r].maps, &kc,       &src,    &staged, &flags,
                     &ts_log,     &sink,     &bitsum, &err,    &block_timing,
-                    &grid_arrivals, &grid_ready};
+                    &grid_arrivals, &grid_ready, &chunk_done};
     CUDA_CHECK(cudaLaunchCooperativeKernel(
         (void*)e4::ag_consume_kernel, dim3(grid), dim3(e4::kThreads), args,
         e4::smem_bytes(), R[r].compute));
@@ -1016,10 +1039,10 @@ struct Bench {
     for (int r = 0; r < world; ++r) {
       const size_t lo = e4::blocked_off(r * rps, 0, P);
       const size_t hi = e4::blocked_off((r + 1) * rps, 0, P);
-      if (lo && !device_equal(R[r].A_staged, R[r].A_shadow, lo * 2))
+      if (lo && !device_equal(r, R[r].A_staged, R[r].A_shadow, lo * 2))
         return false;
       if (full_elems() - hi &&
-          !device_equal(R[r].A_staged + hi, R[r].A_shadow + hi,
+          !device_equal(r, R[r].A_staged + hi, R[r].A_shadow + hi,
                         (full_elems() - hi) * 2))
         return false;
     }
@@ -1040,7 +1063,8 @@ struct Bench {
       const size_t base = ce_cycle_off(epoch);  // slot that iteration used
       for (int p = 0; p < world - 1; ++p) {
         const int owner = (r + 1 + p) % world;
-        if (!device_equal(R[r].ce_dst + base + (size_t)p * shard_elems(),
+        if (!device_equal(r,
+                          R[r].ce_dst + base + (size_t)p * shard_elems(),
                           R[owner].A_src, shard_elems() * 2))
           return false;
       }
@@ -1082,7 +1106,7 @@ struct Bench {
 
   int unit_chunk(int i, int rank) const {
     const int rb = unit_rb(i, rank);
-    return cfg.panel_mode ? rb * cpr + (i % P) / H : rb / G;
+    return cfg.panel_mode ? (rb * P + (i % P)) / H : rb / G;
   }
 
   // remote-unit wait times from the per-tile timestamp ring (local units
@@ -1224,11 +1248,14 @@ int main(int argc, char** argv) {
     const std::vector<int>& granularities =
         cfg.panel_mode ? cfg.panel_hs : cfg.gs;
     for (int gran : granularities) {
+      const int panels_per_shard = b.rps * b.P;
       if ((!cfg.panel_mode && (gran < 1 || b.rps % gran)) ||
-          (cfg.panel_mode && (gran < 1 || b.P % gran))) {
+          (cfg.panel_mode &&
+           (gran < 1 || panels_per_shard % gran))) {
         if (cfg.panel_mode)
-          std::fprintf(stderr, "skip H=%d: P=%d panels/row not divisible\n",
-                       gran, b.P);
+          std::fprintf(stderr,
+                       "skip H=%d: %d panels/shard not divisible\n", gran,
+                       panels_per_shard);
         else
           std::fprintf(stderr,
                        "skip G=%d: %d row-blocks/shard not divisible\n",
@@ -1250,8 +1277,7 @@ int main(int argc, char** argv) {
           b.ce_panelized = cfg.panel_mode && vn == "ce-panelized";
           b.G = cfg.panel_mode ? 1 : gran;
           b.H = cfg.panel_mode ? gran : 0;
-          b.cpr = cfg.panel_mode ? b.P / b.H : 0;
-          b.cps = cfg.panel_mode ? b.rps * b.cpr : b.rps / b.G;
+          b.cps = cfg.panel_mode ? panels_per_shard / b.H : b.rps / b.G;
           b.n_chunks = b.world * b.cps;
           if (b.n_chunks > e4::kMaxChunks) {
             std::fprintf(stderr, "skip %c=%d: %d chunks > %d flag slots\n",
@@ -1259,9 +1285,12 @@ int main(int argc, char** argv) {
                          e4::kMaxChunks);
             continue;
           }
-          b.n_comm = (v == V_TMA)
-                         ? std::min(std::min(nc, b.n_sm - 1), b.n_jobs())
-                         : 0;
+          b.n_comm =
+              (v == V_TMA)
+                  ? std::min(
+                        std::min(nc, b.n_sm - 1),
+                        cfg.panel_mode ? b.n_jobs() * b.H : b.n_jobs())
+                  : 0;
           // A flag micro-kernel cannot run if waiting consumers occupy every
           // SM.  The normal H800 path uses stream memops; keep one SM free for
           // the explicitly requested/unavailable-memop fallback.
