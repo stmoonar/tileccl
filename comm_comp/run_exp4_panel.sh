@@ -188,6 +188,7 @@ else
       --panel-h 1,16,64,256 \
       --n-comm 4 \
       --iters 5 \
+      --warmup-ms 10 \
       --verify \
       --modes fused,compute-only
 

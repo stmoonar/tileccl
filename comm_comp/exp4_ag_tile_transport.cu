@@ -746,11 +746,28 @@ struct Bench {
       CUDA_CHECK(cudaEventRecord(R[r].e_beg, R[r].compute));
       prev[r] = R[r].e_beg;
     }
-    for (int w = 0; w < warm; ++w) enqueue_iter(mode, prev, 0, -1, -1);
-    // re-anchor timing after warmup (exp2 discipline)
+    // Warmup used to enqueue every pass through the same started[0]/done[0]
+    // events.  Those events are also cross-device stream barriers, so
+    // re-recording them while an earlier record was still pending could leave
+    // one rank behind a newly-recorded event while the other ranks were
+    // already spinning in their consumer kernels.  Warmup is not measured:
+    // retire each pass completely before reusing its event slot.
+    for (int w = 0; w < warm; ++w) {
+      enqueue_iter(mode, prev, 0, -1, -1);
+      for (int r = 0; r < world; ++r) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaEventSynchronize(R[r].done[0]));
+        for (auto& s : R[r].comm) CUDA_CHECK(cudaStreamSynchronize(s));
+        CUDA_CHECK(cudaStreamSynchronize(R[r].compute));
+      }
+    }
+    // Re-anchor both timing and cross-rank sequencing after warmup.  In
+    // particular, do not leave prev pointing at done[0], which the first
+    // measured iteration is about to record again.
     for (int r = 0; r < world; ++r) {
       CUDA_CHECK(cudaSetDevice(r));
       CUDA_CHECK(cudaEventRecord(R[r].e_beg, R[r].compute));
+      prev[r] = R[r].e_beg;
     }
     const auto t_enq0 = std::chrono::steady_clock::now();
     const int log_base = std::max(0, iters - e4::kLogIters);
@@ -1158,6 +1175,10 @@ static bool has_mode(const Config& c, const char* name) {
 }
 
 int main(int argc, char** argv) {
+  // The runner pipes output through tee.  Keep each completed line visible so
+  // a timeout identifies the exact configuration instead of the last flush.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  std::setvbuf(stderr, nullptr, _IONBF, 0);
   Bench b;
   b.cfg = parse_args(argc, argv);
   const Config& cfg = b.cfg;
