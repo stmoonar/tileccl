@@ -295,7 +295,10 @@ blob 与 peer 分片逐位一致；(d) CE/TMA 两变体计算校验和逐位相�
 
 三者的字节数、flag 粒度和 consumer 工作完全相同。CE consumer 按实验定义
 读取预变换 shadow。宿主默认使用每 GPU 一个持久 worker 并行提交，模拟 Flux
-一进程一卡；`--serial-host` 仅用于复现/诊断旧的四 rank 串行提交偏差。
+一进程一卡；每轮先在所有 rank 提交自旋等待 flag 的 consumer，再并行提交 CE
+copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前提前到达。
+`--serial-host` 仅用于复现/诊断旧的四 rank 串行提交偏差。CE `comm-only` 先探测
+单轮时间，再按 `--window-ms` 自适应选择不少于 10 轮的样本数。
 
 ```bash
 # 快速正确性检查
@@ -335,7 +338,8 @@ panel 模式下 CSV 仍令 `g_rb=1`，并新增末尾列 `axis=panel` 与 `panel
   开销，CUDA 12.9 无弃用问题），不需要链接 libcuda；exp4 的 CE 旗标是被测
   机制本身，所以照 flux 用 `cuStreamWriteValue32`，但经
   `cudaGetDriverEntryPoint` 运行时解析（CUTLASS 同款机制），仍不链接
-  libcuda，拿不到符号时退化为打了 `flag_mech=kernel` 标签的微 kernel。
+  libcuda，拿不到符号时退化为打了 `flag_mech=kernel` 标签的微 kernel；该回退
+  会自动空出 1 个 SM，避免 consumer 全占满 SM 后 flag kernel 无法调度。
 - 避开了 12.x 已弃用的 `cudaDeviceProp::clockRate`（用
   `cudaDeviceGetAttribute` 查询）；未使用 legacy IPC、NVML NvLink 系列等
   flux 中在新 toolkit 上有摩擦的 API。

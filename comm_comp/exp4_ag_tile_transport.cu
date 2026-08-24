@@ -19,7 +19,9 @@
 //         cannot produce the tile-blocked layout the consumer wants, so this
 //         variant is a SIMULATION: the copied bytes are the real rows (volume
 //         and content faithful), but the consumer loads from a pre-transformed
-//         local shadow buffer.
+//         local shadow buffer. All ranks submit their waiting consumers before
+//         the host starts this iteration's copies, so active time cannot be
+//         shortened accidentally by copy-call submission latency.
 //   tma : blockIdx.x < n_comm blocks of the SAME kernel are dedicated comm
 //         blocks that pull the peers' panels with 2D tensor-map TMA loads
 //         (descriptors host-encoded over PEER pointers), store them
@@ -303,6 +305,7 @@ struct Bench {
   Variant var = V_CE;
   int G = 1, H = 0, cpr = 0, cps = 0, n_chunks = 0;
   int n_comm = 0, n_compute = 0;
+  int ce_reserve_eff = 0;
   bool ce_panelized = false;
   int chunk_major = 0;
 
@@ -633,6 +636,11 @@ struct Bench {
     const bool ce_comm =
         var == V_CE && (mode == M_FUSED || mode == M_BYSTANDER ||
                         mode == M_LOCAL || mode == M_MEMOP);
+    // Phase 1: submit every consumer before any CE producer.  The consumer
+    // must be resident and waiting when the first tile can arrive; otherwise
+    // host time spent enqueueing many small copies lets early flags become
+    // ready before the kernel starts and makes active-time comparisons depend
+    // on copy-call count rather than the intended dependency timeline.
     parallel_ranks([&](int r) {
       CUDA_CHECK(cudaSetDevice(r));
       if (ce_comm)
@@ -641,13 +649,15 @@ struct Bench {
             CUDA_CHECK(cudaStreamWaitEvent(R[r].comm[si], prev[q], 0));
       for (int q = 0; q < world; ++q)
         CUDA_CHECK(cudaStreamWaitEvent(R[r].compute, prev[q], 0));
-      if (ce_comm) enqueue_ce_comm(r, mode);
-      CUDA_CHECK(cudaSetDevice(r));
       CUDA_CHECK(cudaEventRecord(R[r].started[slot], R[r].compute));
       launch_consume(r, mode, log_slot);
       CUDA_CHECK(cudaSetDevice(r));
       CUDA_CHECK(cudaEventRecord(R[r].done[slot], R[r].compute));
     });
+    // Phase 2: only after all ranks have submitted their waiting consumers do
+    // the host workers enqueue this iteration's CE copies and flag publishes.
+    if (ce_comm)
+      parallel_ranks([&](int r) { enqueue_ce_comm(r, mode); });
     for (int r = 0; r < world; ++r) prev[r] = R[r].done[slot];
   }
 
@@ -712,7 +722,7 @@ struct Bench {
 
   // CE copies+flags alone, wall clock over reps (exp2 run_comm_alone_us):
   // one aggregate number for the concurrent 4-rank AG.
-  double run_ce_comm_only_us(int reps) {
+  double run_ce_comm_only_us(double window_ms, int* reps_out) {
     auto pass = [&]() {
       ++epoch;
       parallel_ranks([&](int r) { enqueue_ce_comm(r, M_FUSED); });
@@ -723,6 +733,15 @@ struct Bench {
       });
     };
     for (int w = 0; w < 2; ++w) pass();
+
+    const auto probe0 = std::chrono::steady_clock::now();
+    pass();
+    const double probe_us = wall_ms_since(probe0) * 1000.0;
+    const double target_us = std::max(1.0, window_ms * 1000.0);
+    const int reps = std::max(
+        10, std::min(10000, (int)(target_us / std::max(1.0, probe_us) + 0.999)));
+    if (reps_out) *reps_out = reps;
+
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < reps; ++i) pass();
     return wall_ms_since(t0) * 1000.0 / reps;
@@ -1144,10 +1163,16 @@ int main(int argc, char** argv) {
           b.n_comm = (v == V_TMA)
                          ? std::min(std::min(nc, b.n_sm - 1), b.n_jobs())
                          : 0;
-          const int ce_reserve =
-              v == V_CE ? std::min(cfg.ce_reserve_sm, b.n_sm - 1) : 0;
+          // A flag micro-kernel cannot run if waiting consumers occupy every
+          // SM.  The normal H800 path uses stream memops; keep one SM free for
+          // the explicitly requested/unavailable-memop fallback.
+          b.ce_reserve_eff =
+              v == V_CE
+                  ? std::min(std::max(cfg.ce_reserve_sm, b.use_memop ? 0 : 1),
+                             b.n_sm - 1)
+                  : 0;
           b.n_compute =
-              std::min(b.n_sm - b.n_comm - ce_reserve, b.n_units);
+              std::min(b.n_sm - b.n_comm - b.ce_reserve_eff, b.n_units);
           b.chunk_major =
               (!cfg.panel_mode && v == V_CE && cfg.comm_streams > 1) ? 1 : 0;
           b.reset_flags();
@@ -1169,7 +1194,7 @@ int main(int argc, char** argv) {
             std::printf(" copy-calls/rank=%d streams=%d ce-reserve-sm=%d",
                         b.n_jobs() *
                             ((cfg.panel_mode && b.ce_panelized) ? b.H : 1),
-                        cfg.comm_streams, ce_reserve);
+                        cfg.comm_streams, b.ce_reserve_eff);
           std::printf(" grid=%d ---\n", grid);
 
           // verify
@@ -1232,10 +1257,12 @@ int main(int argc, char** argv) {
           if (w_byst) byst = b.time_mode(M_BYSTANDER, 2, iters_of(est_b), false);
 
           double ce_comm_us = 0;
+          int ce_comm_reps = 0;
           ModeStats tcomm{};
           if (w_comm) {
             if (v == V_CE) {
-              ce_comm_us = b.run_ce_comm_only_us(10);
+              ce_comm_us =
+                  b.run_ce_comm_only_us(cfg.window_ms, &ce_comm_reps);
             } else {
               ModeStats cprobe = b.time_mode(M_COMMONLY, 0, 2, false);
               tcomm = b.time_mode(M_COMMONLY, 2, iters_of(max_mean(cprobe)),
@@ -1317,7 +1344,7 @@ int main(int argc, char** argv) {
                   st.mn, st.mx, bus, drift, slowdown, interf, stall, gbps,
                   w ? w->p50 : 0, w ? w->p95 : 0, w ? w->mx : 0, bsum, errs,
                   ver, cfg.panel_mode ? "panel" : "row", b.H, e2e_mean,
-                  host_ms, v == V_CE ? cfg.ce_reserve_sm : 0);
+                  host_ms, v == V_CE ? b.ce_reserve_eff : 0);
             };
             row("compute-only", base.st[r], it_b, 0, 0, 0, 0, nullptr,
                 base.err_count, base.e2e[r].mean, base.host_ms_per_iter);
@@ -1351,20 +1378,22 @@ int main(int argc, char** argv) {
                            nullptr, 0, arr.st[r].mean, 0);
           }
           if (w_comm && v == V_CE) {
-            std::printf("  comm: %.1fus %.1fGB/s/rank\n", ce_comm_us, gbps_ce);
+            std::printf("  comm: %.1fus %.1fGB/s/rank (%d reps)\n", ce_comm_us,
+                        gbps_ce, ce_comm_reps);
             if (csv)  // aggregate wall-clock row, rank = -1
               std::fprintf(
                   csv,
                   "%s,comm-only,%s,%s,-1,%d,%d,%d,%d,%d,%d,%zu,0,0,%d,%d,%d,"
-                  "%d,%d,0,%u,%.2f,%.2f,%.2f,%.2f,%.2f,0,0,0,0,0,%.2f,0,0,0,"
+                  "%d,%d,%d,%u,%.2f,%.2f,%.2f,%.2f,%.2f,0,0,0,0,0,%.2f,0,0,0,"
                   "%016llx,0,%s,%s,%d,%.2f,%.4f,%d\n",
                   b.var_name(), b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", b.world, b.M, cfg.n,
                   b.K, b.G, b.n_chunks, chunk_bytes, cfg.comm_streams,
-                  b.slices_eff, cfg.intensity, grid, e4::kThreads, b.epoch,
+                  b.slices_eff, cfg.intensity, grid, e4::kThreads, ce_comm_reps,
+                  b.epoch,
                   ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us,
                   gbps_ce, 0ull, ver, cfg.panel_mode ? "panel" : "row", b.H,
-                  ce_comm_us, 0.0, cfg.ce_reserve_sm);
+                  ce_comm_us, 0.0, b.ce_reserve_eff);
           }
           if (w_comm && v == V_TMA) {
             double m = 0;
