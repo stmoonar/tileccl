@@ -311,6 +311,50 @@ else
           --csv "$OUT/exp4_tma_delivery_${TAG}.csv"
       done
 
+      # ---------------------------------------------------------------
+      # Compute-density sweep: how far does the granularity result travel?
+      #
+      # The whole H sweep runs at --intensity 1024, where the synthetic
+      # compute takes ~4.86 ms against ~4.9 ms of transfer.  That B/A ~ 1 is
+      # a deliberate stress point, and it is what makes granularity matter:
+      # a ready group leaves A/(4*cps) of compute with nothing to overlap,
+      # and the tail is only hidden when
+      #
+      #     B <= A - A/(4*cps)        (cps = 1  =>  B <= 0.75*A)
+      #
+      # flux sits on the other side of that line.  Its AG uses SPLIT=1, so
+      # n_data_chunks = world_size and each ready group is a whole peer shard
+      # -- our cps=1 point, the worst one here.  But a real fused AG+GEMM at
+      # this shape (M_gathered=65536, N=K=8192, fp16 = 8.8 TFLOP) runs ~13.5
+      # ms at the 653 TFLOPS exp1 measured on this box, against the same
+      # ~4.9 ms of transfer: B/A ~ 0.36, far below 0.75, so the tail never
+      # surfaces and coarse groups cost flux nothing.
+      #
+      # --intensity is FMA ops per loaded 16 B, so it scales A directly.
+      # 1024 is ~36% of a real GEMM's density and 2850 is ~100%; sweeping
+      # through that range shows where granularity sensitivity disappears
+      # and bounds how far the fine-grained conclusion can be carried.
+      # H is restricted to the crossover region and flux's own granularity.
+      # ---------------------------------------------------------------
+      for INT in 1024 2048 2850 4096; do
+        run_case "exp4_intensity_${INT}" 2400 \
+          ./exp4_ag_tile_transport \
+          --ndev 4 \
+          --m 65536 \
+          --k 8192 \
+          --panel-h 64,256,1024,4096,16384 \
+          --n-comm 16 \
+          --comm-streams 3 \
+          --ce-ring-mib 8 \
+          --intensity $INT \
+          --variants ce-aggregate,tma \
+          --verify \
+          --modes fused,compute-only,bystander \
+          --warmup-ms 500 \
+          --window-ms 5000 \
+          --csv "$OUT/exp4_intensity_${INT}.csv"
+      done
+
       validate_active_clocks
     fi
     stop_sampler
