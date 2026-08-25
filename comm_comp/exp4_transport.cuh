@@ -39,11 +39,11 @@ constexpr int kStages = 8;      // TMA pipeline depth: 8 x 16 KiB smem
 constexpr int kFlagStride = 32; // ints per flag -> one 128 B line each
 constexpr uint32_t kArmed = 0x7FFFFFFFu;  // "local chunk, always ready"
 constexpr int kMaxWorld = 8;
-// Extended panel sweep: M=32768, K=8192 on four GPUs gives 8192 panels/shard
-// and 32768 compute units / flag slots at H=1.  This permits H=8192, i.e.
-// one 128-MiB ready group per peer shard.
-constexpr int kMaxChunks = 32768;
-constexpr int kMaxUnits = 32768;
+// Extended panel sweep: M=65536, K=8192 on four GPUs gives 16384 panels/shard
+// and 65536 compute units / flag slots at H=1.  This permits H=16384, i.e.
+// one 256-MiB ready group per peer shard.
+constexpr int kMaxChunks = 65536;
+constexpr int kMaxUnits = 65536;
 constexpr int kLogIters = 8;     // per-tile timestamp ring depth
 
 inline size_t smem_bytes() {

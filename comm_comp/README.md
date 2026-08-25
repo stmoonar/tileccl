@@ -309,28 +309,29 @@ copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前�
 
 # 正式 H sweep：16 KiB -- 2 MiB/flag，总字节数固定
 ./exp4_ag_tile_transport --k 8192 \
-    --panel-h 1,2,4,8,16,32,64,128 --n-comm 8 --verify \
+    --panel-h 1,2,4,8,16,32,64,128 --n-comm 12 --verify \
     --modes fused,compute-only,comm-only,bystander,local,memop-cost \
     --warmup-ms 500 --window-ms 200 --csv exp4_panel.csv
 
 # 当前最小主实验：只生成 Fig2 左图所需的 fused/compute-only slowdown。
-# M=32768、K=8192 时每个 peer shard 是 128 MiB，H 从 1 扫到 8192，
-# 即 16 KiB--128 MiB/flag；总字节数和计算量在 sweep 内保持不变。
+# M=65536、K=8192 时每个 peer shard 是 256 MiB，H 从 1 扫到 16384，
+# 即 16 KiB--256 MiB/flag；TMA 固定使用 12 个通信 SM，总字节数和计算量
+# 在 sweep 内保持不变。
 # （脚本含 1300 MHz 锁频、负载持频检查、verify 和结果打包）
 ./run_exp4_panel.sh
 
 # 本地绘图：只画 CE aggregate/TMA，分别输出 mean、p50、p95 三张 PNG/PDF
 python plot_exp4_fig2_left.py /path/to/extracted_result
 
-# 等 SM 对照：CE 也空出与 n_comm=8 相同的 8 个 compute block
+# 等 SM 对照：CE 也空出与 n_comm=12 相同的 12 个 compute block
 ./exp4_ag_tile_transport --k 8192 --panel-h 1,8,128 \
-    --variants ce-aggregate --ce-reserve-sm 8 --verify \
+    --variants ce-aggregate --ce-reserve-sm 12 --verify \
     --modes fused,compute-only,bystander,memop-cost \
     --warmup-ms 500 --window-ms 200 --csv exp4_panel_ce_isosm.csv
 
 # TMA 通信 SM 数校准
 ./exp4_ag_tile_transport --k 8192 --panel-h 1,8,128 --variants tma \
-    --n-comm 1,2,4,8,16 --verify \
+    --n-comm 1,2,4,8,12,16 --verify \
     --modes fused,compute-only,comm-only,bystander \
     --warmup-ms 500 --window-ms 200 --csv exp4_panel_ncomm.csv
 ```
@@ -341,8 +342,8 @@ TMA 在整个 H sweep 中只使用一种静态调度：把全部 remote panel �
 ready-group 顺序线性编号，通信 block `b` 始终处理 `b, b+n_comm, ...`。每个
 ready group 的完成 panel 数由 device counter 汇合，最后一个贡献者发布唯一
 flag。这样所有 H 下每个通信 block 搬运相同数量的 panel，不再在 32 MiB 处
-切换算法，也不会把 128 MiB 的 TMA 静默降成 3 个 SM。row 模式仍按 job 分配。
-128 MiB 点需要 `M=32768,K=8192`，主要 device buffer 合计约 1.5 GiB/GPU；
+切换算法，也不会把 256 MiB 的 TMA 静默降成 3 个 SM。row 模式仍按 job 分配。
+256 MiB 点需要 `M=65536,K=8192`，主要 device buffer 合计约 3 GiB/GPU；
 实验只检验 CE/TMA 是否出现 crossover，不预设 CE 必然超过。
 
 Fig2 左图的 `t_us_*`/`slowdown` 不使用 kernel 尾部 CUDA event：同一 kernel 的

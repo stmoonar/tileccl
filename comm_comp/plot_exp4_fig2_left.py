@@ -13,7 +13,7 @@ import pandas as pd
 
 LABELS = {
     "ce-aggregate": "CE aggregate",
-    "tma": "TMA",
+    "tma": "TMA (12 comm SMs)",
 }
 COLORS = {
     "ce-aggregate": "#d55e00",
@@ -25,6 +25,10 @@ STAT_COLUMNS = {
     "p50": "t_us_p50",
     "p95": "t_us_p95",
 }
+EXPECTED_WORLD = 4
+EXPECTED_M = 65536
+EXPECTED_K = 8192
+EXPECTED_TMA_COMM_SMS = 12
 
 
 def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path) -> None:
@@ -54,7 +58,7 @@ def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path) -> None:
     ax.axhline(1.0, color="black", linestyle="--", linewidth=1)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
-    ticks = [16 * (1 << power) for power in range(14)]
+    ticks = [16 * (1 << power) for power in range(15)]
     ax.set_xticks(ticks)
     ax.set_xticklabels(
         [f"{x}K" if x < 1024 else f"{x // 1024}M" for x in ticks],
@@ -95,6 +99,22 @@ def main() -> None:
         raise SystemExit(f"unexpected modes: {sorted(set(data['mode']))}")
     if data["drift_pct"].abs().max() > 2.0:
         raise SystemExit("paired compute baseline drift exceeds 2%")
+    for column, expected_value in {
+        "world": EXPECTED_WORLD,
+        "m": EXPECTED_M,
+        "k": EXPECTED_K,
+    }.items():
+        observed_values = set(data[column])
+        if observed_values != {expected_value}:
+            raise SystemExit(
+                f"expected {column}={expected_value}, got {sorted(observed_values)}"
+            )
+    tma_comm_sms = set(data.loc[data["variant"] == "tma", "n_comm"])
+    if tma_comm_sms != {EXPECTED_TMA_COMM_SMS}:
+        raise SystemExit(
+            f"expected TMA n_comm={EXPECTED_TMA_COMM_SMS}, "
+            f"got {sorted(tma_comm_sms)}"
+        )
 
     keys = ["variant", "panel_h", "rank"]
     columns = keys + list(STAT_COLUMNS.values())
@@ -115,7 +135,7 @@ def main() -> None:
     expected = {
         (variant, h)
         for variant in LABELS
-        for h in range(1, 8193)
+        for h in range(1, 16385)
         if h & (h - 1) == 0
     }
     observed = set(zip(paired["variant"], paired["panel_h"]))
