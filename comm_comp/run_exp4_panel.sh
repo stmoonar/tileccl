@@ -188,6 +188,7 @@ else
       --panel-h 1,16,64,256 \
       --n-comm 16 \
       --comm-streams 3 \
+      --ce-ring-mib 1 \
       --variants ce-aggregate,tma \
       --iters 5 \
       --warmup-ms 10 \
@@ -206,6 +207,7 @@ else
         --panel-h 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384 \
         --n-comm 16 \
         --comm-streams 3 \
+        --ce-ring-mib 8 \
         --variants ce-aggregate,tma \
         --verify \
         --modes fused,compute-only \

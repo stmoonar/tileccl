@@ -11,10 +11,7 @@ from matplotlib.figure import Figure
 import pandas as pd
 
 
-LABELS = {
-    "ce-aggregate": "CE aggregate",
-    "tma": "TMA (12 comm SMs)",
-}
+VARIANTS = ("ce-aggregate", "tma")
 COLORS = {
     "ce-aggregate": "#d55e00",
     "tma": "#0072b2",
@@ -28,10 +25,30 @@ STAT_COLUMNS = {
 EXPECTED_WORLD = 4
 EXPECTED_M = 65536
 EXPECTED_K = 8192
-EXPECTED_TMA_COMM_SMS = 12
 
 
-def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path) -> None:
+def variant_labels(data: pd.DataFrame) -> dict:
+    """Derive labels from the CSV so config changes cannot silently mislabel
+    the figure; each variant must be internally consistent instead of
+    matching a hardcoded expectation."""
+    tma_comm_sms = sorted(set(data.loc[data["variant"] == "tma", "n_comm"]))
+    if len(tma_comm_sms) != 1:
+        raise SystemExit(f"mixed TMA n_comm values in one bundle: {tma_comm_sms}")
+    streams = sorted(set(data.loc[data["variant"] == "ce-aggregate",
+                                  "comm_streams"]))
+    ce_label = (
+        f"CE aggregate ({streams[0]} stream{'s' if streams[0] > 1 else ''})"
+        if len(streams) == 1
+        else f"CE aggregate (streams {'/'.join(map(str, streams))} by chunk)"
+    )
+    return {
+        "ce-aggregate": ce_label,
+        "tma": f"TMA ({tma_comm_sms[0]} comm SMs)",
+    }
+
+
+def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path,
+             labels: dict) -> None:
     column = STAT_COLUMNS[stat]
     value = f"slowdown_{stat}"
     paired = paired.copy()
@@ -45,12 +62,12 @@ def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path) -> None:
     fig = Figure(figsize=(8.2, 4.2))
     FigureCanvasAgg(fig)
     ax = fig.subplots()
-    for variant in LABELS:
+    for variant in VARIANTS:
         rows = curves[curves["variant"] == variant]
         ax.plot(
             rows["panel_h"] * 16,  # KiB: one physical panel is 16 KiB
             rows[value],
-            label=LABELS[variant],
+            label=labels[variant],
             color=COLORS[variant],
             marker=MARKERS[variant],
             linewidth=2,
@@ -91,7 +108,7 @@ def main() -> None:
     data = pd.read_csv(csv)
     # Older bundles may contain the retired CE 16-KiB-copy diagnostic.  It is
     # deliberately ignored rather than allowed to dominate the main figure.
-    data = data[data["variant"].isin(LABELS)].copy()
+    data = data[data["variant"].isin(VARIANTS)].copy()
     bad = data[(data["verify"] != "ok") | (data["err_count"] != 0)]
     if not bad.empty:
         raise SystemExit(f"refusing to plot {len(bad)} invalid rows")
@@ -109,12 +126,7 @@ def main() -> None:
             raise SystemExit(
                 f"expected {column}={expected_value}, got {sorted(observed_values)}"
             )
-    tma_comm_sms = set(data.loc[data["variant"] == "tma", "n_comm"])
-    if tma_comm_sms != {EXPECTED_TMA_COMM_SMS}:
-        raise SystemExit(
-            f"expected TMA n_comm={EXPECTED_TMA_COMM_SMS}, "
-            f"got {sorted(tma_comm_sms)}"
-        )
+    labels = variant_labels(data)
 
     keys = ["variant", "panel_h", "rank"]
     columns = keys + list(STAT_COLUMNS.values())
@@ -134,7 +146,7 @@ def main() -> None:
 
     expected = {
         (variant, h)
-        for variant in LABELS
+        for variant in VARIANTS
         for h in range(1, 16385)
         if h & (h - 1) == 0
     }
@@ -158,7 +170,7 @@ def main() -> None:
         }
     )
     for stat in STAT_COLUMNS:
-        plot_one(paired, stat, out_dir)
+        plot_one(paired, stat, out_dir, labels)
     print(f"wrote mean/p50/p95 figures to {out_dir}")
 
 

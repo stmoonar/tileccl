@@ -105,6 +105,12 @@ struct Config {
                                     "bystander", "local",        "memop-cost",
                                     "arrival"};
   int comm_streams = 1;  // 1 = flux-faithful single stream, 3 = one per peer
+  // With --comm-streams 3, chunks at or above this size fall back to the
+  // serial single-stream ring: concurrent bulk peer copies share ingress
+  // bandwidth so no chunk is ready until nearly all bytes have moved, while
+  // the serial ring hands the consumer one finished peer at a time
+  // (20260825_052700: 3 streams at 32 MiB chunks cost 1.44x vs the ring).
+  double ce_ring_mib = 8;
   int ce_reserve_sm = 0; // iso-SM control: leave this many SM slots unused
   int intensity = 1024;  // FMA ops per loaded 16 B vector
   int slices = 16;       // K-slices per row-block (compute units per rb)
@@ -132,6 +138,10 @@ static void usage(const char* prog) {
       "  --modes LIST     fused,compute-only,comm-only,bystander,local,\n"
       "                   memop-cost,arrival (default all)\n"
       "  --comm-streams N CE streams: 1 = serial ring (flux), 3 = per peer\n"
+      "                   (3 also splits host submission across per-peer\n"
+      "                   workers; chunks >= --ce-ring-mib keep the ring)\n"
+      "  --ce-ring-mib X  chunk size (MiB) at which per-peer streams fall\n"
+      "                   back to the serial ring (default 8)\n"
       "  --ce-reserve-sm N leave N compute blocks unused for iso-SM control\n"
       "  --intensity N    FMA ops per 16 B vector (default 1024)\n"
       "  --slices N       K-slices per row-block (default 16)\n"
@@ -177,6 +187,7 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--variants") { c.variants = split_csv(next()); var_set = true; }
     else if (a == "--modes") { c.modes = split_csv(next()); mode_set = true; }
     else if (a == "--comm-streams") c.comm_streams = std::atoi(next().c_str());
+    else if (a == "--ce-ring-mib") c.ce_ring_mib = std::atof(next().c_str());
     else if (a == "--ce-reserve-sm") c.ce_reserve_sm = std::atoi(next().c_str());
     else if (a == "--intensity") c.intensity = std::atoi(next().c_str());
     else if (a == "--slices") c.slices = std::atoi(next().c_str());
@@ -200,6 +211,10 @@ static Config parse_args(int argc, char** argv) {
   (void)k_set; (void)g_set; (void)nc_set; (void)var_set; (void)mode_set;
   if (c.comm_streams != 1 && c.comm_streams != 3) {
     std::fprintf(stderr, "--comm-streams must be 1 or 3\n");
+    std::exit(1);
+  }
+  if (c.ce_ring_mib <= 0) {
+    std::fprintf(stderr, "--ce-ring-mib must be positive\n");
     std::exit(1);
   }
   if (c.ce_reserve_sm < 0) {
@@ -312,7 +327,7 @@ struct Bench {
   std::mutex worker_mu;
   std::condition_variable worker_cv, worker_done_cv;
   std::function<void(int)> worker_task;
-  int worker_generation = 0, worker_done = 0;
+  int worker_generation = 0, worker_done = 0, worker_count = 0;
   bool worker_stop = false;
 
   // per-K geometry
@@ -326,6 +341,7 @@ struct Bench {
   int ce_reserve_eff = 0;
   bool ce_panelized = false;
   int chunk_major = 0;
+  int streams_eff = 1;  // per-case: cfg.comm_streams, or 1 above ce-ring-mib
 
   uint32_t epoch = 0;
 
@@ -342,10 +358,16 @@ struct Bench {
     return ce_panelized ? "ce-panelized" : "ce-aggregate";
   }
 
+  // One worker per (rank, peer) pair so per-peer CE submission can run in
+  // parallel: the per-copy cost is dominated by the submitting thread's CUDA
+  // calls (~14 us each, 20260825_052700), and per-peer streams without
+  // per-peer submitters leave that cost fully serialized per rank.
+  // parallel_ranks dispatches only the first `world` workers.
   void start_workers() {
     if (!cfg.parallel_host) return;
-    for (int r = 0; r < world; ++r) {
-      workers.emplace_back([this, r]() {
+    const int n_workers = world * std::max(1, world - 1);
+    for (int w = 0; w < n_workers; ++w) {
+      workers.emplace_back([this, w]() {
         int seen = 0;
         for (;;) {
           std::function<void(int)> task;
@@ -358,27 +380,38 @@ struct Bench {
             seen = worker_generation;
             task = worker_task;
           }
-          task(r);
+          if (w < worker_count) task(w);
           {
             std::lock_guard<std::mutex> lock(worker_mu);
-            if (++worker_done == world) worker_done_cv.notify_one();
+            if (++worker_done == (int)workers.size())
+              worker_done_cv.notify_one();
           }
         }
       });
     }
   }
 
-  void parallel_ranks(const std::function<void(int)>& task) {
+  void parallel_jobs(int count, const std::function<void(int)>& task) {
     if (!cfg.parallel_host) {
-      for (int r = 0; r < world; ++r) task(r);
+      for (int j = 0; j < count; ++j) task(j);
       return;
+    }
+    if (count > (int)workers.size()) {
+      std::fprintf(stderr, "parallel_jobs: %d tasks > %zu workers\n", count,
+                   workers.size());
+      std::exit(1);
     }
     std::unique_lock<std::mutex> lock(worker_mu);
     worker_task = task;
+    worker_count = count;
     worker_done = 0;
     ++worker_generation;
     worker_cv.notify_all();
-    worker_done_cv.wait(lock, [&] { return worker_done == world; });
+    worker_done_cv.wait(lock, [&] { return worker_done == (int)workers.size(); });
+  }
+
+  void parallel_ranks(const std::function<void(int)>& task) {
+    parallel_jobs(world, task);
   }
 
   void stop_workers() {
@@ -584,28 +617,19 @@ struct Bench {
   // CE comm production for rank r's iteration `epoch`: pull mode, copies on
   // this rank's high-priority stream(s) in ring order (exp2 pattern), each
   // chunk's copy followed by its flag publish on the same stream (flux
-  // all_gather_op structure).
-  void enqueue_ce_comm(int r, Mode mode, bool wait_consumer = true) {
+  // all_gather_op structure).  One call submits all of one peer's chunks in
+  // ascending order on stream s; the caller decides how peers map to streams
+  // and submitting threads.
+  void enqueue_ce_peer(int r, Mode mode, int peer_i, cudaStream_t s) {
     RankBuf& b = R[r];
-    CUDA_CHECK(cudaSetDevice(r));
-    // The cooperative consumer grid publishes grid_ready only after every
-    // persistent block is resident and waiting.  This closes the cross-stream
-    // race where CE traffic could otherwise start before the consumer kernel.
-    if (wait_consumer)
-      for (int si = 0; si < cfg.comm_streams; ++si)
-        CU_CHECK(drv.wait32((CUstream)b.comm[si],
-                            (CUdeviceptr)b.grid_ready, epoch,
-                            CU_STREAM_WAIT_VALUE_GEQ));
-    auto do_chunk = [&](int peer_i, int c_in) {
-      const int owner = (r + 1 + peer_i) % world;
-      cudaStream_t s = b.comm[cfg.comm_streams == 1 ? 0 : peer_i];
-      const size_t elems = cfg.panel_mode
-                               ? (size_t)H * e4::kPanelElems
-                               : (size_t)G * e4::kRbRows * K;
+    const int owner = (r + 1 + peer_i) % world;
+    const size_t elems = cfg.panel_mode ? (size_t)H * e4::kPanelElems
+                                        : (size_t)G * e4::kRbRows * K;
+    for (int c_in = 0; c_in < cps; ++c_in) {
       const size_t off = (size_t)c_in * elems;
       if (mode != M_MEMOP) {
-        __half* dst =
-            b.ce_dst + ce_cycle_off(epoch) + (size_t)peer_i * shard_elems() + off;
+        __half* dst = b.ce_dst + ce_cycle_off(epoch) +
+                      (size_t)peer_i * shard_elems() + off;
         const __half* src =
             mode == M_LOCAL ? b.A_src + off : R[owner].A_src + off;
         auto copy_one = [&](size_t elem_off, size_t n_elem) {
@@ -632,13 +656,39 @@ struct Bench {
         e4::flag_set_kernel<<<1, 1, 0, s>>>(flag, epoch);
         CUDA_CHECK(cudaGetLastError());
       }
-    };
-    if (cfg.comm_streams == 1) {  // rank-major on the single serial stream
-      for (int p = 0; p < world - 1; ++p)
-        for (int c = 0; c < cps; ++c) do_chunk(p, c);
-    } else {  // chunk-major across the per-peer streams
-      for (int c = 0; c < cps; ++c)
-        for (int p = 0; p < world - 1; ++p) do_chunk(p, c);
+    }
+  }
+
+  // The cooperative consumer grid publishes grid_ready only after every
+  // persistent block is resident and waiting.  This closes the cross-stream
+  // race where CE traffic could otherwise start before the consumer kernel.
+  void gate_ce_stream(RankBuf& b, cudaStream_t s) {
+    CU_CHECK(drv.wait32((CUstream)s, (CUdeviceptr)b.grid_ready, epoch,
+                        CU_STREAM_WAIT_VALUE_GEQ));
+  }
+
+  // CE production for all ranks.  streams_eff == 1: one worker per rank
+  // submits the ring rank-major on comm[0] (flux-faithful, and the right
+  // schedule for bulk chunks -- see ce_ring_mib).  streams_eff > 1: one
+  // worker per (rank, peer) submits that peer's chunks on its own stream, so
+  // both the copy engines AND the ~14 us/call host submission run per-peer
+  // parallel.
+  void enqueue_ce_all(Mode mode, bool wait_consumer = true) {
+    if (streams_eff == 1) {
+      parallel_ranks([&](int r) {
+        CUDA_CHECK(cudaSetDevice(r));
+        if (wait_consumer) gate_ce_stream(R[r], R[r].comm[0]);
+        for (int p = 0; p < world - 1; ++p)
+          enqueue_ce_peer(r, mode, p, R[r].comm[0]);
+      });
+    } else {
+      const int peers = world - 1;
+      parallel_jobs(world * peers, [&](int j) {
+        const int r = j / peers, p = j % peers;
+        CUDA_CHECK(cudaSetDevice(r));
+        if (wait_consumer) gate_ce_stream(R[r], R[r].comm[p]);
+        enqueue_ce_peer(r, mode, p, R[r].comm[p]);
+      });
     }
   }
 
@@ -663,7 +713,7 @@ struct Bench {
     kc.comm_enabled = (var == V_TMA && mode != M_COMPUTE) ? 1 : 0;
     kc.local_mode = (var == V_TMA && mode == M_LOCAL) ? 1 : 0;
     kc.flag_scope_sys = var == V_CE ? 1 : 0;
-    kc.chunk_major = (var == V_CE && cfg.comm_streams > 1) ? 1 : 0;
+    kc.chunk_major = chunk_major;
     kc.log_slot = log_slot;
     kc.timing_slot = timing_slot;
     kc.timing_stride = n_sm;
@@ -710,7 +760,7 @@ struct Bench {
     parallel_ranks([&](int r) {
       CUDA_CHECK(cudaSetDevice(r));
       if (ce_comm)
-        for (int si = 0; si < cfg.comm_streams; ++si)
+        for (int si = 0; si < streams_eff; ++si)
           for (int q = 0; q < world; ++q)
             CUDA_CHECK(cudaStreamWaitEvent(R[r].comm[si], prev[q], 0));
       for (int q = 0; q < world; ++q)
@@ -722,8 +772,7 @@ struct Bench {
     });
     // Phase 2: only after all ranks have submitted their waiting consumers do
     // the host workers enqueue this iteration's CE copies and flag publishes.
-    if (ce_comm)
-      parallel_ranks([&](int r) { enqueue_ce_comm(r, mode); });
+    if (ce_comm) enqueue_ce_all(mode);
     for (int r = 0; r < world; ++r) prev[r] = R[r].done[slot];
   }
 
@@ -866,11 +915,10 @@ struct Bench {
   double run_ce_comm_only_us(double window_ms, int* reps_out) {
     auto pass = [&]() {
       ++epoch;
-      parallel_ranks(
-          [&](int r) { enqueue_ce_comm(r, M_FUSED, false); });
+      enqueue_ce_all(M_FUSED, false);
       parallel_ranks([&](int r) {
         CUDA_CHECK(cudaSetDevice(r));
-        for (int si = 0; si < cfg.comm_streams; ++si)
+        for (int si = 0; si < streams_eff; ++si)
           CUDA_CHECK(cudaStreamSynchronize(R[r].comm[si]));
       });
     };
@@ -912,7 +960,7 @@ struct Bench {
         for (int q = 0; q < world; ++q) {
           CUDA_CHECK(cudaStreamWaitEvent(R[r].obs, prev[q], 0));
           if (var == V_CE) {
-            for (int si = 0; si < cfg.comm_streams; ++si)
+            for (int si = 0; si < streams_eff; ++si)
               CUDA_CHECK(cudaStreamWaitEvent(R[r].comm[si], prev[q], 0));
           } else {
             CUDA_CHECK(cudaStreamWaitEvent(R[r].compute, prev[q], 0));
@@ -920,8 +968,7 @@ struct Bench {
         }
       });
       if (var == V_CE)
-        parallel_ranks(
-            [&](int r) { enqueue_ce_comm(r, M_FUSED, false); });
+        enqueue_ce_all(M_FUSED, false);
       else
         parallel_ranks(
             [&](int r) { launch_consume(r, M_ARRIVAL, -1, -1); });
@@ -1205,6 +1252,10 @@ int main(int argc, char** argv) {
               b.world, b.n_sm, b.use_memop ? "memop" : "kernel",
               cfg.comm_streams, cfg.intensity, cfg.slices,
               cfg.ce_cycle_dst ? ", ce-cycle-dst" : "");
+  if (cfg.comm_streams > 1)
+    std::printf("ce submission: per-peer streams + per-peer host workers; "
+                "chunks >= %.1f MiB fall back to the serial ring\n",
+                cfg.ce_ring_mib);
   if (cfg.panel_mode)
     std::printf("panel mode: one unit = 128x64 fp16 = 16 KiB; --panel-h "
                 "controls panels per ready flag\n");
@@ -1336,13 +1387,20 @@ int main(int argc, char** argv) {
                   : 0;
           b.n_compute =
               std::min(b.n_sm - b.n_comm - b.ce_reserve_eff, b.n_units);
-          // Chunk-major whenever the per-peer CE streams publish chunk-major,
-          // panel mode included, so the consume order tracks arrival order.
-          b.chunk_major = (v == V_CE && cfg.comm_streams > 1) ? 1 : 0;
-          b.reset_flags();
           const size_t chunk_bytes =
               cfg.panel_mode ? (size_t)b.H * e4::kPanelBytes
                              : (size_t)b.G * e4::kRbRows * b.K * 2;
+          // Bulk chunks keep the serial ring even under --comm-streams 3:
+          // see Config::ce_ring_mib.
+          b.streams_eff =
+              (v == V_CE && cfg.comm_streams > 1 &&
+               (double)chunk_bytes < cfg.ce_ring_mib * (double)(1 << 20))
+                  ? cfg.comm_streams
+                  : 1;
+          // Chunk-major whenever the per-peer CE streams publish chunk-major,
+          // panel mode included, so the consume order tracks arrival order.
+          b.chunk_major = (v == V_CE && b.streams_eff > 1) ? 1 : 0;
+          b.reset_flags();
           const int n_comm_eff = (v == V_TMA) ? b.n_comm : 0;
           const int grid = b.n_comm + b.n_compute;
 
@@ -1358,7 +1416,7 @@ int main(int argc, char** argv) {
             std::printf(" copy-calls/rank=%d streams=%d ce-reserve-sm=%d",
                         b.n_jobs() *
                             ((cfg.panel_mode && b.ce_panelized) ? b.H : 1),
-                        cfg.comm_streams, b.ce_reserve_eff);
+                        b.streams_eff, b.ce_reserve_eff);
           std::printf(" grid=%d ---\n", grid);
 
           // verify
@@ -1519,7 +1577,7 @@ int main(int argc, char** argv) {
                   b.var_name(), mode, b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", r, b.world, b.M,
                   cfg.n, b.K, b.G, b.n_chunks, chunk_bytes, b.n_comm,
-                  n_comm_eff, cfg.comm_streams, b.slices_eff, cfg.intensity,
+                  n_comm_eff, b.streams_eff, b.slices_eff, cfg.intensity,
                   grid, e4::kThreads, iters, b.epoch, st.mean, st.p50, st.p95,
                   st.mn, st.mx, bus, drift, slowdown, interf, stall, gbps,
                   w ? w->p50 : 0, w ? w->p95 : 0, w ? w->mx : 0, bsum, errs,
@@ -1568,7 +1626,7 @@ int main(int argc, char** argv) {
                   "%016llx,0,%s,%s,%d,%.2f,%.4f,%d\n",
                   b.var_name(), b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", b.world, b.M, cfg.n,
-                  b.K, b.G, b.n_chunks, chunk_bytes, cfg.comm_streams,
+                  b.K, b.G, b.n_chunks, chunk_bytes, b.streams_eff,
                   b.slices_eff, cfg.intensity, grid, e4::kThreads, ce_comm_reps,
                   b.epoch,
                   ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us,
