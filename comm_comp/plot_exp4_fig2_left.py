@@ -18,12 +18,13 @@ from matplotlib.figure import Figure
 import pandas as pd
 
 
-VARIANTS = ("ce-aggregate", "tma")
+VARIANTS = ("ce-aggregate", "ce-panelized", "tma")
 COLORS = {
     "ce-aggregate": "#d55e00",
+    "ce-panelized": "#b8860b",
     "tma": "#0072b2",
 }
-MARKERS = {"ce-aggregate": "o", "tma": "^"}
+MARKERS = {"ce-aggregate": "o", "ce-panelized": "s", "tma": "^"}
 STAT_COLUMNS = {
     "mean": "t_us_mean",
     "p50": "t_us_p50",
@@ -41,17 +42,27 @@ def variant_labels(data: pd.DataFrame) -> dict:
     tma_comm_sms = sorted(set(data.loc[data["variant"] == "tma", "n_comm"]))
     if len(tma_comm_sms) != 1:
         raise SystemExit(f"mixed TMA n_comm values in one bundle: {tma_comm_sms}")
-    streams = sorted(set(data.loc[data["variant"] == "ce-aggregate",
-                                  "comm_streams"]))
-    ce_label = (
-        f"CE aggregate ({streams[0]} stream{'s' if streams[0] > 1 else ''})"
-        if len(streams) == 1
-        else f"CE aggregate (streams {'/'.join(map(str, streams))} by chunk)"
-    )
-    return {
-        "ce-aggregate": ce_label,
-        "tma": f"TMA ({tma_comm_sms[0]} comm SMs)",
-    }
+    # Bundles predating the cross-group pipeline have no tma_xchunk column;
+    # they are all per-group drain, but say nothing rather than guess.
+    suffix = ""
+    if "tma_xchunk" in data.columns:
+        sched = sorted(set(data.loc[data["variant"] == "tma", "tma_xchunk"]))
+        if len(sched) != 1:
+            raise SystemExit(f"mixed TMA scheduling in one bundle: {sched}")
+        suffix = "" if sched[0] else ", per-group drain"
+    tma_label = f"TMA ({tma_comm_sms[0]} comm SMs{suffix})"
+    labels = {"tma": tma_label}
+    for v, stem in (("ce-aggregate", "CE aggregate"),
+                    ("ce-panelized", "CE per panel")):
+        if v not in set(data["variant"]):
+            continue
+        streams = sorted(set(data.loc[data["variant"] == v, "comm_streams"]))
+        labels[v] = (
+            f"{stem} ({streams[0]} stream{'s' if streams[0] > 1 else ''})"
+            if len(streams) == 1
+            else f"{stem} (streams {'/'.join(map(str, streams))} by chunk)"
+        )
+    return labels
 
 
 def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path,
@@ -70,6 +81,8 @@ def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path,
     FigureCanvasAgg(fig)
     ax = fig.subplots()
     for variant in VARIANTS:
+        if variant not in labels:
+            continue
         rows = curves[curves["variant"] == variant]
         ax.plot(
             rows["panel_h"] * 16,  # KiB: one physical panel is 16 KiB
@@ -113,14 +126,13 @@ def main() -> None:
     out_dir.mkdir(exist_ok=True)
 
     data = pd.read_csv(csv)
-    # Older bundles may contain the retired CE 16-KiB-copy diagnostic.  It is
-    # deliberately ignored rather than allowed to dominate the main figure.
     data = data[data["variant"].isin(VARIANTS)].copy()
+    # bystander is measured alongside fused for the interference/stall
+    # split; it is not part of this figure.
+    data = data[data["mode"].isin(["compute-only", "fused"])].copy()
     bad = data[(data["verify"] != "ok") | (data["err_count"] != 0)]
     if not bad.empty:
         raise SystemExit(f"refusing to plot {len(bad)} invalid rows")
-    if set(data["mode"]) != {"compute-only", "fused"}:
-        raise SystemExit(f"unexpected modes: {sorted(set(data['mode']))}")
     if data["drift_pct"].abs().max() > 2.0:
         raise SystemExit("paired compute baseline drift exceeds 2%")
     for column, expected_value in {
@@ -160,7 +172,7 @@ def main() -> None:
 
     expected = {
         (variant, h)
-        for variant in VARIANTS
+        for variant in labels
         for h in range(1, 16385)
         if h & (h - 1) == 0
     }

@@ -190,7 +190,7 @@ else
       --n-comm 16 \
       --comm-streams 3 \
       --ce-ring-mib 1 \
-      --variants ce-aggregate,tma \
+      --variants ce-aggregate,ce-panelized,tma \
       --iters 5 \
       --warmup-ms 10 \
       --verify \
@@ -200,7 +200,34 @@ else
     if [ "$LAST_CASE_RC" -ne 0 ] || [ "$CLOCK_VALID" -ne 1 ]; then
       echo "!! formal experiments skipped after verify/clock-hold failure"
     else
-      run_case exp4_fig2_left 7200 \
+      # ---------------------------------------------------------------
+      # Definitive sweep.  Three transports over the same ready-group axis:
+      #
+      #   ce-aggregate  one CE call per ready group.  Assumes the group's H
+      #                 panels can be moved as one contiguous range, which
+      #                 holds only because this arm is traffic-faithful (it
+      #                 copies row-major bytes into a scratch blob and the
+      #                 consumer reads a pre-staged tile-blocked buffer).  It
+      #                 is the OPTIMISTIC bound on CE, not a layout-correct
+      #                 transfer.
+      #   ce-panelized  one CE call per 128x64 panel.  A ready group of H
+      #                 panels is a strided 2D region of the row-major peer
+      #                 shard, so a copy engine cannot gather it in one call;
+      #                 this arm charges CE the per-call cost it would really
+      #                 pay.  The call count is 49152/rank at EVERY H, so the
+      #                 curve shows CE's cost is set by call count, not by
+      #                 bytes -- coarsening the ready group buys nothing while
+      #                 the data stays non-contiguous.  Still optimistic: each
+      #                 call here is a flat 16 KiB copy, whereas producing the
+      #                 blocked layout would need a 2D copy per panel.
+      #   tma           the comm SMs gather the same panels via tensor-map
+      #                 loads and produce the blocked layout as a side effect.
+      #
+      # bystander (comm running, gates pre-armed) is measured alongside fused
+      # so interference and dependency stalling can be separated instead of
+      # inferred from the wait distribution.
+      # ---------------------------------------------------------------
+      run_case exp4_fig2_left 10800 \
         ./exp4_ag_tile_transport \
         --ndev 4 \
         --m 65536 \
@@ -209,21 +236,41 @@ else
         --n-comm 16 \
         --comm-streams 3 \
         --ce-ring-mib 8 \
-        --variants ce-aggregate,tma \
+        --variants ce-aggregate,ce-panelized,tma \
         --verify \
-        --modes fused,compute-only \
+        --modes fused,compute-only,bystander \
         --warmup-ms 500 \
         --window-ms 5000 \
         --csv "$OUT/exp4_fig2_left.csv"
 
       validate_active_clocks
 
-      # Coarse-chunk stability recheck: 20260825_060124 measured the H=4096
-      # ring case 24% above 20260825_050003 with rank-asymmetric fused times
-      # and ~zero flag waits -- suspected ring de-phasing, not a code path
-      # difference.  Three repetitions with a doubled window bound the
-      # run-to-run spread; comm-only isolates the pure CE transfer wall clock
-      # and arrival records the flag arrival pattern behind any recurrence.
+      # TMA control arm: per-group drain, the scheduling every bundle before
+      # 20260825_121843 used.  Keeps the older data comparable and quantifies
+      # what the cross-group pipeline is worth over the full sweep rather than
+      # only the H <= 256 half that 121843 covered.
+      run_case exp4_tma_drain 3600 \
+        ./exp4_ag_tile_transport \
+        --ndev 4 \
+        --m 65536 \
+        --k 8192 \
+        --panel-h 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384 \
+        --n-comm 16 \
+        --variants tma \
+        --tma-drain \
+        --verify \
+        --modes fused,compute-only \
+        --warmup-ms 500 \
+        --window-ms 5000 \
+        --csv "$OUT/exp4_tma_drain.csv"
+
+      validate_active_clocks
+
+      # Coarse-chunk repetitions: CE's single-stream ring has a 10-20%
+      # run-to-run spread at bulk chunk sizes (20260825_062853 onwards), so
+      # the coarse points are reported as a median over four samples with the
+      # spread shown.  ce-panelized is left out here: its call count is
+      # granularity-independent, so it has nothing to add at coarse H.
       for REP in 1 2 3; do
         run_case "exp4_coarse_recheck_rep${REP}" 1800 \
           ./exp4_ag_tile_transport \
@@ -244,24 +291,8 @@ else
 
       validate_active_clocks
 
-      # TMA delivery-rate probe across the FULL H sweep.
-      #
-      # comm-only runs the same kernel with n_compute=0, so it reads the
-      # 16 comm SMs' delivery rate directly instead of reverse-solving it from
-      # `fused - tail`; at coarse H the two already agree to within 2%.
-      # 20260825_105601 measured the flat ~66 GB/s for H <= 16 and pinned the
-      # cause: process_job() pipelines only `items` panels and then drains,
-      # and items = ceil((H - panel_lane)/n_comm) is 1 for every H <= n_comm,
-      # so each panel pays an unoverlapped load + store + drain.  That run
-      # also falsified the depth hypothesis -- kStages 8 -> 13 moved nothing,
-      # exactly as one item per call predicts -- so the deep binary stays in
-      # the Makefile but is no longer part of the routine run.
-      #
-      # --tma-xchunk rolls one pipeline across ready groups and publishes each
-      # group kStages-2 panels behind the store stream.  Same panels, same
-      # order, same load balance: only the drain placement differs, so this is
-      # a clean A/B on that one decision.
-      for SPEC in "drain:" "xchunk:--tma-xchunk"; do
+      # Pure TMA delivery rate (n_compute=0), both schedulings, full sweep.
+      for SPEC in "xchunk:" "drain:--tma-drain"; do
         TAG=${SPEC%%:*}
         XFLAG=${SPEC#*:}
         run_case "exp4_tma_delivery_${TAG}" 1800 \
@@ -279,24 +310,6 @@ else
           --window-ms 2000 \
           --csv "$OUT/exp4_tma_delivery_${TAG}.csv"
       done
-
-      # End-to-end effect of the same switch over the fine-H half, where the
-      # plateau lives.  The default-mode counterpart for these H values is
-      # already in exp4_fig2_left.csv, so this is the paired arm.
-      run_case exp4_tma_fused_xchunk 1800 \
-        ./exp4_ag_tile_transport \
-        --ndev 4 \
-        --m 65536 \
-        --k 8192 \
-        --panel-h 1,2,4,8,16,32,64,128,256 \
-        --n-comm 16 \
-        --variants tma \
-        --tma-xchunk \
-        --verify \
-        --modes fused,compute-only \
-        --warmup-ms 500 \
-        --window-ms 5000 \
-        --csv "$OUT/exp4_tma_fused_xchunk.csv"
 
       validate_active_clocks
     fi

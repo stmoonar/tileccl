@@ -119,7 +119,7 @@ struct Config {
   int ndev = 0;
   bool verify = false, flag_kernel = false, ce_cycle_dst = false;
   bool parallel_host = true;
-  bool tma_xchunk = false;  // TMA: pipeline across ready groups
+  bool tma_xchunk = true;   // TMA: pipeline across ready groups
   bool panel_mode = false;
   std::string csv, dump;
 };
@@ -143,9 +143,9 @@ static void usage(const char* prog) {
       "                   workers; chunks >= --ce-ring-mib keep the ring)\n"
       "  --ce-ring-mib X  chunk size (MiB) at which per-peer streams fall\n"
       "                   back to the serial ring (default 8)\n"
-      "  --tma-xchunk     TMA: roll one pipeline across ready groups\n"
-      "                   instead of draining per ready group (lifts the\n"
-      "                   H <= n_comm delivery plateau)\n"
+      "  --tma-drain      TMA: drain per ready group (pre-24f0a5a\n"
+      "                   control arm; default rolls one pipeline across\n"
+      "                   groups, which is >= drain at every H)\n"
       "  --ce-reserve-sm N leave N compute blocks unused for iso-SM control\n"
       "  --intensity N    FMA ops per 16 B vector (default 1024)\n"
       "  --slices N       K-slices per row-block (default 16)\n"
@@ -193,6 +193,7 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--comm-streams") c.comm_streams = std::atoi(next().c_str());
     else if (a == "--ce-ring-mib") c.ce_ring_mib = std::atof(next().c_str());
     else if (a == "--tma-xchunk") c.tma_xchunk = true;
+    else if (a == "--tma-drain") c.tma_xchunk = false;
     else if (a == "--ce-reserve-sm") c.ce_reserve_sm = std::atoi(next().c_str());
     else if (a == "--intensity") c.intensity = std::atoi(next().c_str());
     else if (a == "--slices") c.slices = std::atoi(next().c_str());
@@ -1493,7 +1494,19 @@ int main(int argc, char** argv) {
               b.time_mode(M_COMPUTE, 2, std::max(5, it_b / 4), false);
 
           ModeStats byst{};
-          if (w_byst) byst = b.time_mode(M_BYSTANDER, 2, iters_of(est_b), false);
+          // These modes still submit the full CE copy list, so their cost
+          // is not bounded by the COMPUTE baseline: with ce-panelized at
+          // 49152 copies/rank an iteration is ~0.6 s, and sizing from
+          // est_b would ask for ~1000 of them.  Probe each mode first, as
+          // fused already does.
+          auto probed = [&](Mode m) {
+            ModeStats pr = b.time_mode(m, 0, 2, false);
+            const double est = max_mean(pr);
+            return b.time_mode(
+                m, iters_for_ms(cfg.warmup_ms, est, 2, kMaxIters),
+                iters_of(est), false);
+          };
+          if (w_byst) byst = probed(M_BYSTANDER);
 
           double ce_comm_us = 0;
           int ce_comm_reps = 0;
@@ -1511,12 +1524,12 @@ int main(int argc, char** argv) {
 
           ModeStats local{};
           if (w_local) {
-            local = b.time_mode(M_LOCAL, 2, iters_of(est_b), false);
+            local = probed(M_LOCAL);
             if (v == V_TMA) b.restore_staged();
           }
           ModeStats memop{};
           const bool run_memop = w_memop && v == V_CE;
-          if (run_memop) memop = b.time_mode(M_MEMOP, 2, iters_of(est_b), false);
+          if (run_memop) memop = probed(M_MEMOP);
 
           ModeStats arr{};
           std::vector<std::vector<uint64_t>> arr_log;
