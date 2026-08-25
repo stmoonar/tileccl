@@ -216,6 +216,32 @@ else
         --csv "$OUT/exp4_fig2_left.csv"
 
       validate_active_clocks
+
+      # Coarse-chunk stability recheck: 20260825_060124 measured the H=4096
+      # ring case 24% above 20260825_050003 with rank-asymmetric fused times
+      # and ~zero flag waits -- suspected ring de-phasing, not a code path
+      # difference.  Three repetitions with a doubled window bound the
+      # run-to-run spread; comm-only isolates the pure CE transfer wall clock
+      # and arrival records the flag arrival pattern behind any recurrence.
+      for REP in 1 2 3; do
+        run_case "exp4_coarse_recheck_rep${REP}" 1800 \
+          ./exp4_ag_tile_transport \
+          --ndev 4 \
+          --m 65536 \
+          --k 8192 \
+          --panel-h 2048,4096,8192,16384 \
+          --n-comm 16 \
+          --comm-streams 3 \
+          --ce-ring-mib 8 \
+          --variants ce-aggregate,tma \
+          --verify \
+          --modes fused,compute-only,comm-only,arrival \
+          --warmup-ms 500 \
+          --window-ms 10000 \
+          --csv "$OUT/exp4_coarse_recheck_rep${REP}.csv"
+      done
+
+      validate_active_clocks
     fi
     stop_sampler
   fi

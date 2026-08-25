@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 
-"""Plot corrected Fig2-left mean, p50, and p95 compute slowdowns."""
+"""Plot Fig2-left mean, p50, and p95 end-to-end cost curves.
+
+Both variants are normalized by the SAME baseline: CE's compute-only pass,
+which runs the synthetic compute on all 132 SMs.  Normalizing each variant by
+its own compute-only (the earlier revision) silently refunds TMA the n_comm
+SMs it removes from compute -- the structural tax is part of the transport's
+cost and must be charged, so the y axis reads "time to finish the same
+compute + communication, relative to undisturbed full-SM compute"."""
 
 import argparse
 from pathlib import Path
@@ -83,8 +90,8 @@ def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path,
         ha="right",
     )
     ax.set_xlabel("Data released per ready flag")
-    ax.set_ylabel(f"Fused {stat} / compute-only {stat}")
-    ax.set_title(f"Dependent-compute slowdown: {stat} (worst rank)")
+    ax.set_ylabel(f"Fused {stat} / full-SM compute {stat}")
+    ax.set_title(f"End-to-end cost vs full-SM compute: {stat} (worst rank)")
     ax.legend(frameon=False)
     fig.tight_layout()
     stem = out_dir / f"fig2_left_compute_slowdown_{stat}"
@@ -130,13 +137,20 @@ def main() -> None:
 
     keys = ["variant", "panel_h", "rank"]
     columns = keys + list(STAT_COLUMNS.values())
-    base = data[(data["mode"] == "compute-only") & (data["rank"] >= 0)][columns]
+    # Common denominator: CE's compute-only pass runs on all 132 SMs, so both
+    # curves are charged against the same undisturbed-compute baseline and
+    # TMA's n_comm-SM structural tax stays in its curve (see module docstring).
+    base = data[
+        (data["mode"] == "compute-only")
+        & (data["rank"] >= 0)
+        & (data["variant"] == "ce-aggregate")
+    ][["panel_h", "rank"] + list(STAT_COLUMNS.values())]
     fused = data[(data["mode"] == "fused") & (data["rank"] >= 0)][columns]
     paired = fused.merge(
         base,
-        on=keys,
+        on=["panel_h", "rank"],
         suffixes=("_fused", "_base"),
-        validate="one_to_one",
+        validate="many_to_one",
     )
     if any(
         (paired[f"{column}_base"] <= 0).any()
