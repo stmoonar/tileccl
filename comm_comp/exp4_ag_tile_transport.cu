@@ -746,13 +746,25 @@ struct Bench {
       CUDA_CHECK(cudaEventRecord(R[r].e_beg, R[r].compute));
       prev[r] = R[r].e_beg;
     }
-    // Warmup used to enqueue every pass through the same started[0]/done[0]
-    // events.  Those events are also cross-device stream barriers, so
-    // re-recording them while an earlier record was still pending could leave
-    // one rank behind a newly-recorded event while the other ranks were
-    // already spinning in their consumer kernels.  Warmup is not measured:
-    // retire each pass completely before reusing its event slot.
+    // Warmup reuses the started[0]/done[0] event slot every pass, and
+    // cudaStreamWaitEvent binds to whichever record is most recent AT ENQUEUE
+    // time.  Phase 1 of enqueue_iter runs on concurrent per-rank workers, so
+    // even with each pass fully retired, worker r's wait on done[0] of rank q
+    // could bind to the record worker q was concurrently making for the SAME
+    // pass.  Bound that way, rank r launches its consumer only after rank q's
+    // finishes -- and a CE-fused consumer finishes only after its own comm
+    // stream's waits clear, which may symmetrically be bound to rank r.  Two
+    // ranks then spin in their kernels while the other two never launch (the
+    // ce-aggregate H=64 hang; odds grow with the pass count, warmup_ms/est).
+    // Since every pass is retired below, cross-pass sequencing through done[0]
+    // is unnecessary: re-anchor prev to e_beg each pass, recorded HERE, where
+    // no concurrent worker can re-record it.
     for (int w = 0; w < warm; ++w) {
+      for (int r = 0; r < world; ++r) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaEventRecord(R[r].e_beg, R[r].compute));
+        prev[r] = R[r].e_beg;
+      }
       enqueue_iter(mode, prev, 0, -1, -1);
       for (int r = 0; r < world; ++r) {
         CUDA_CHECK(cudaSetDevice(r));
