@@ -216,10 +216,6 @@ static Config parse_args(int argc, char** argv) {
       std::exit(1);
     }
     if (!var_set) c.variants = {"ce-aggregate", "tma"};
-    if (c.comm_streams != 1) {
-      std::fprintf(stderr, "panel mode currently requires --comm-streams 1\n");
-      std::exit(1);
-    }
     for (int h : c.panel_hs) {
       if (h < 1) {
         std::fprintf(stderr, "--panel-h values must be positive\n");
@@ -1340,8 +1336,9 @@ int main(int argc, char** argv) {
                   : 0;
           b.n_compute =
               std::min(b.n_sm - b.n_comm - b.ce_reserve_eff, b.n_units);
-          b.chunk_major =
-              (!cfg.panel_mode && v == V_CE && cfg.comm_streams > 1) ? 1 : 0;
+          // Chunk-major whenever the per-peer CE streams publish chunk-major,
+          // panel mode included, so the consume order tracks arrival order.
+          b.chunk_major = (v == V_CE && cfg.comm_streams > 1) ? 1 : 0;
           b.reset_flags();
           const size_t chunk_bytes =
               cfg.panel_mode ? (size_t)b.H * e4::kPanelBytes
