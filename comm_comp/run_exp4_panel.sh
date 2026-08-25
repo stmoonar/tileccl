@@ -154,7 +154,8 @@ nvidia-smi -i "$EXP4_GPU_IDS" \
   --format=csv > "$OUT/clocks_before.csv" 2>&1
 
 echo "=== build ==="
-make exp4_ag_tile_transport -j4 2>&1 | tee "$OUT/build.log"
+make exp4_ag_tile_transport exp4_ag_tile_transport_deep -j4 2>&1 \
+  | tee "$OUT/build.log"
 BUILD_RC=${PIPESTATUS[0]}
 echo "$BUILD_RC" > "$OUT/build.exitcode"
 
@@ -242,6 +243,45 @@ else
       done
 
       validate_active_clocks
+
+      # TMA delivery-rate probe across the FULL H sweep.
+      #
+      # 20260825_062853 showed TMA's implied delivery rate flat at ~66 GB/s for
+      # H <= 16 and ~145 GB/s from H >= 256 -- with the panel count constant at
+      # 49152, so it is a per-panel efficiency effect, not a work-volume one.
+      # That rate was reverse-solved from `fused - tail`, which conflates slow
+      # delivery with compute stalling for some other reason.  comm-only runs
+      # the same kernel with n_compute=0, so it reads the delivery rate
+      # directly; at coarse H it already agrees with the reverse-solved value
+      # to within 2%.  CE is excluded: its comm-only path is the host
+      # wall-clock loop, which disagrees with fused by 20-60% (unresolved) and
+      # would submit 49152 copies per pass at H=1.
+      #
+      # The _deep binary is the same source at E4_TMA_STAGES=13 (vs 8).  The
+      # prologue issues min(H, kStages-2) loads, so if pipeline depth is what
+      # binds, the plateau moves; if it does not move, the limiter is the
+      # per-panel store handshake (tma_store_commit + tma_store_wait_read<1>)
+      # and that is what would have to change.
+      for SPEC in "stages8:exp4_ag_tile_transport" \
+                  "stages13:exp4_ag_tile_transport_deep"; do
+        TAG=${SPEC%%:*}
+        BIN=${SPEC#*:}
+        run_case "exp4_tma_delivery_${TAG}" 1800 \
+          "./$BIN" \
+          --ndev 4 \
+          --m 65536 \
+          --k 8192 \
+          --panel-h 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384 \
+          --n-comm 16 \
+          --variants tma \
+          --verify \
+          --modes comm-only,compute-only \
+          --warmup-ms 200 \
+          --window-ms 2000 \
+          --csv "$OUT/exp4_tma_delivery_${TAG}.csv"
+      done
+
+      validate_active_clocks
     fi
     stop_sampler
   fi
@@ -266,9 +306,11 @@ cp \
   run_exp4_panel.sh \
   "$OUT/" 2>> "$OUT/package.log" || FAILED=1
 
-if [ -f exp4_ag_tile_transport ]; then
-  cp exp4_ag_tile_transport "$OUT/" 2>> "$OUT/package.log" || FAILED=1
-fi
+for BIN in exp4_ag_tile_transport exp4_ag_tile_transport_deep; do
+  if [ -f "$BIN" ]; then
+    cp "$BIN" "$OUT/" 2>> "$OUT/package.log" || FAILED=1
+  fi
+done
 
 git diff --binary > "$OUT/source.diff"
 git log -1 --oneline > "$OUT/commit.txt"

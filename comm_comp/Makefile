@@ -20,6 +20,11 @@ NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) -lineinfo -DNDEBUG \
 TARGETS := exp1_ce_interference exp2_ag_gemm_granularity exp3_epilogue_remote \
            exp3_gemm_rs_fused exp4_ag_tile_transport
 
+# Same source, deeper TMA pipeline. Built as a separate binary so the depth
+# hypothesis for the fine-H delivery plateau is an A/B against an otherwise
+# identical build (see exp4_transport.cuh:kStages).
+E4_DEEP_STAGES ?= 13
+
 .PHONY: all clean
 
 all: $(TARGETS)
@@ -45,5 +50,11 @@ exp3_gemm_rs_fused: exp3_gemm_rs_fused.cu common.cuh gemm_sm90.cuh \
 exp4_ag_tile_transport: exp4_ag_tile_transport.cu common.cuh exp4_transport.cuh
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread -o $@ $<
 
+exp4_ag_tile_transport_deep: exp4_ag_tile_transport.cu common.cuh \
+                             exp4_transport.cuh
+	$(NVCC) $(NVCCFLAGS) -DE4_TMA_STAGES=$(E4_DEEP_STAGES) \
+	        -Xcompiler -pthread -o $@ $<
+
 clean:
-	rm -f $(TARGETS) $(addsuffix .exe,$(TARGETS))
+	rm -f $(TARGETS) exp4_ag_tile_transport_deep \
+	      $(addsuffix .exe,$(TARGETS)) exp4_ag_tile_transport_deep.exe

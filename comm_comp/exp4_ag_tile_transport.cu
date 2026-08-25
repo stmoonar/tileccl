@@ -1259,6 +1259,8 @@ int main(int argc, char** argv) {
   if (cfg.panel_mode)
     std::printf("panel mode: one unit = 128x64 fp16 = 16 KiB; --panel-h "
                 "controls panels per ready flag\n");
+  std::printf("tma pipeline: %d stages x 16 KiB = %.0f KiB smem/block\n",
+              e4::kStages, e4::smem_bytes() / 1024.0);
   std::printf("host rank submission: %s\n",
               cfg.parallel_host ? "parallel workers" : "serial diagnostic");
   std::printf("timing: cooperative persistent grid, 1 block/SM; t_us_* = "
@@ -1288,7 +1290,7 @@ int main(int argc, char** argv) {
                    "drift_pct,slowdown,interference_sd,stall_sd,comm_gbps,"
                    "wait_p50_us,wait_p95_us,wait_max_us,bitsum_hex,err_count,"
                    "verify,axis,panel_h,e2e_us_mean,host_enqueue_ms,"
-                   "ce_reserve_sm\n");
+                   "ce_reserve_sm,tma_stages\n");
   }
   std::vector<FILE*> dt(b.world, nullptr), da(b.world, nullptr);
   if (!cfg.dump.empty()) {
@@ -1573,7 +1575,8 @@ int main(int argc, char** argv) {
                   csv,
                   "%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%d,%d,%d,%d,%d,"
                   "%d,%d,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,"
-                  "%.4f,%.2f,%.2f,%.2f,%.2f,%016llx,%u,%s,%s,%d,%.2f,%.4f,%d\n",
+                  "%.4f,%.2f,%.2f,%.2f,%.2f,%016llx,%u,%s,%s,%d,%.2f,%.4f,%d,"
+                  "%d\n",
                   b.var_name(), mode, b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", r, b.world, b.M,
                   cfg.n, b.K, b.G, b.n_chunks, chunk_bytes, b.n_comm,
@@ -1582,7 +1585,7 @@ int main(int argc, char** argv) {
                   st.mn, st.mx, bus, drift, slowdown, interf, stall, gbps,
                   w ? w->p50 : 0, w ? w->p95 : 0, w ? w->mx : 0, bsum, errs,
                   ver, cfg.panel_mode ? "panel" : "row", b.H, e2e_mean,
-                  host_ms, v == V_CE ? b.ce_reserve_eff : 0);
+                  host_ms, v == V_CE ? b.ce_reserve_eff : 0, e4::kStages);
             };
             row("compute-only", base.st[r], it_b, 0, 0, 0, 0, nullptr,
                 base.err_count, base.e2e[r].mean, base.host_ms_per_iter);
@@ -1623,7 +1626,7 @@ int main(int argc, char** argv) {
                   csv,
                   "%s,comm-only,%s,%s,-1,%d,%d,%d,%d,%d,%d,%zu,0,0,%d,%d,%d,"
                   "%d,%d,%d,%u,%.2f,%.2f,%.2f,%.2f,%.2f,0,0,0,0,0,%.2f,0,0,0,"
-                  "%016llx,0,%s,%s,%d,%.2f,%.4f,%d\n",
+                  "%016llx,0,%s,%s,%d,%.2f,%.4f,%d,%d\n",
                   b.var_name(), b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", b.world, b.M, cfg.n,
                   b.K, b.G, b.n_chunks, chunk_bytes, b.streams_eff,
@@ -1631,7 +1634,7 @@ int main(int argc, char** argv) {
                   b.epoch,
                   ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us,
                   gbps_ce, 0ull, ver, cfg.panel_mode ? "panel" : "row", b.H,
-                  ce_comm_us, 0.0, b.ce_reserve_eff);
+                  ce_comm_us, 0.0, b.ce_reserve_eff, e4::kStages);
           }
           if (w_comm && v == V_TMA) {
             double m = 0;

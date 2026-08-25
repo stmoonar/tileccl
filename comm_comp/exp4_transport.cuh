@@ -35,7 +35,17 @@ constexpr int kPanelCols = 64;                     // columns per panel
 constexpr int kPanelElems = kRbRows * kPanelCols;  // halves per panel
 constexpr uint32_t kPanelBytes = kPanelElems * 2;  // 16 KiB
 constexpr int kThreads = 512;                      // block size, both roles
-constexpr int kStages = 8;      // TMA pipeline depth: 8 x 16 KiB smem
+// TMA pipeline depth, kStages x 16 KiB of smem.  Overridable so the fine-H
+// delivery plateau (~66 GB/s for H <= 16 vs ~145 GB/s at coarse H, bundle
+// 20260825_062853) can be tested against the depth hypothesis: the prologue
+// issues min(H, kStages-2) loads, so if depth is what binds, raising this
+// moves the plateau.  sm_90 allows ~227 KiB of dynamic smem per block, so 13
+// stages fit; the static_assert below is the real guard.
+#ifndef E4_TMA_STAGES
+#define E4_TMA_STAGES 8
+#endif
+constexpr int kStages = E4_TMA_STAGES;
+static_assert(kStages >= 3, "the prologue needs kStages-2 >= 1 slots");
 constexpr int kFlagStride = 32; // ints per flag -> one 128 B line each
 constexpr uint32_t kArmed = 0x7FFFFFFFu;  // "local chunk, always ready"
 constexpr int kMaxWorld = 8;
@@ -49,6 +59,13 @@ constexpr int kLogIters = 8;     // per-tile timestamp ring depth
 inline size_t smem_bytes() {
   return (size_t)kStages * kPanelBytes + kStages * sizeof(uint64_t);
 }
+
+// sm_90 caps dynamic shared memory at 227 KiB per block.  Exceeding it makes
+// cudaFuncSetAttribute fail at startup rather than at build time, so catch it
+// here instead.
+static_assert((size_t)kStages * kPanelBytes + kStages * sizeof(uint64_t) <=
+                  227u * 1024u,
+              "E4_TMA_STAGES exceeds the sm_90 per-block dynamic smem limit");
 
 // ---------------------------------------------------------------------------
 // layout / ordering inlines (single implementation shared by the transform
