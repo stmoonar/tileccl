@@ -341,6 +341,18 @@ struct KCfg {
   int local_mode = 0;    // TMA comm blocks read own shard (map[3])
   int flag_scope_sys = 0; // CE stream memop: sys; same-GPU TMA producer: gpu
   int chunk_major = 0;   // consume order (see rb_order_at)
+  // Cross-ready-group TMA pipelining.  The default path calls process_job()
+  // once per ready group and ends it with a full tma_store_wait_all<0>()
+  // drain, so a block that owns `items` panels of that group pipelines only
+  // those.  items = ceil((H - panel_lane) / n_comm), which is 1 for every
+  // H <= n_comm: each panel then pays an unoverlapped load + store + drain,
+  // which is the ~66 GB/s fine-H delivery plateau (bundle 20260825_105601;
+  // raising kStages did nothing there because one item cannot be pipelined).
+  // With this set, a block instead rolls one pipeline over its whole panel
+  // list and publishes each group's completion lazily, D panels behind the
+  // store stream.  Same panels, same order, same load balance -- only the
+  // drain placement differs.
+  int xchunk = 0;
   int log_slot = -1;     // ts_log ring slot, <0 = no logging
   int timing_slot = -1;  // per-iteration persistent-block timing slot
   int timing_stride = 0; // allocated block records per timing slot
@@ -476,7 +488,85 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
       }
     };
 
-    if (cfg.panel_mode) {
+    if (cfg.panel_mode && cfg.xchunk) {
+      // Cross-ready-group pipeline (see KCfg::xchunk).  The block's panel
+      // list is exactly the one the default path walks -- global panel index
+      // blockIdx.x + k*n_comm -- so the source access pattern and the load
+      // balance are unchanged; only the drain moves.
+      constexpr int kDepth = kStages - 2;
+      const int total_panels = n_jobs * cfg.H;
+      const int first = (int)blockIdx.x;
+      const int my_count =
+          first < total_panels
+              ? (total_panels - first + cfg.n_comm - 1) / cfg.n_comm
+              : 0;
+
+      // k-th panel this block owns -> (chunk, source panel, dest panel)
+      auto locate = [&](int k, int& chunk, int& rb_c, int& p, int& peer_i) {
+        const int pl = first + k * cfg.n_comm;
+        const int j = pl / cfg.H, lane = pl % cfg.H;
+        peer_i = j / cfg.cps;
+        const int c_in = j % cfg.cps;
+        const int flat = c_in * cfg.H + lane;
+        rb_c = flat / cfg.P;
+        p = flat % cfg.P;
+        chunk = ((cfg.rank + 1 + peer_i) % cfg.world) * cfg.cps + c_in;
+      };
+
+      auto issue_k = [&](int k) {
+        int chunk, rb_c, p, peer_i;
+        locate(k, chunk, rb_c, p, peer_i);
+        const CUtensorMap* map =
+            cfg.local_mode ? &maps.m[kMaxWorld - 1] : &maps.m[peer_i];
+        const uint32_t s = (uint32_t)(k % kStages);
+        mbarrier_arrive_expect_tx(&bar[s], kPanelBytes);
+        tma_load_tensor2d(buf + (size_t)s * kPanelBytes, map, p * kPanelCols,
+                          rb_c * kRbRows, &bar[s]);
+      };
+
+      auto store_k = [&](int k) {
+        int chunk, rb_c, p, peer_i;
+        locate(k, chunk, rb_c, p, peer_i);
+        const int owner = (cfg.rank + 1 + peer_i) % cfg.world;
+        const int rb_g = owner * cfg.rb_per_shard + rb_c;
+        const uint32_t s = (uint32_t)(k % kStages);
+        tma_store_1d(staged + blocked_off(rb_g, p, cfg.P),
+                     buf + (size_t)s * kPanelBytes, kPanelBytes);
+        tma_store_commit();
+      };
+
+      // Called only once panel k's store is known to be in HBM, so the
+      // release below still means "data has landed", exactly as in the
+      // default path.  One contribution per panel; the group's H-th
+      // contributor publishes.
+      auto publish_k = [&](int k) {
+        int chunk, rb_c, p, peer_i;
+        locate(k, chunk, rb_c, p, peer_i);
+        const uint32_t old = atomic_add_acq_rel_gpu(&chunk_done[chunk], 1u);
+        if (old + 1u == (uint32_t)cfg.H)
+          st_release_gpu(&flags[flag_idx(chunk)], cfg.epoch);
+      };
+
+      int issued = 0, stored = 0, published = 0;
+      for (; issued < my_count && issued < kDepth; ++issued) issue_k(issued);
+      while (stored < my_count) {
+        const uint32_t s = (uint32_t)(stored % kStages);
+        mbarrier_wait(&bar[s], (phase_bits >> s) & 1u);
+        phase_bits ^= 1u << s;
+        store_k(stored);
+        ++stored;
+        if (issued < my_count) {
+          tma_store_wait_read<1>();
+          issue_k(issued++);
+        }
+        // <= kDepth store groups may still be pending, so groups
+        // 0 .. stored-kDepth-1 have completed end-to-end.
+        tma_store_wait_all<kDepth>();
+        for (; published + kDepth < stored; ++published) publish_k(published);
+      }
+      tma_store_wait_all<0>();
+      for (; published < my_count; ++published) publish_k(published);
+    } else if (cfg.panel_mode) {
       // One scheduling rule for the entire H sweep: globally number all remote
       // panels in rank-major ready-group order and statically stripe them over
       // the communication blocks.  This gives every block the same total

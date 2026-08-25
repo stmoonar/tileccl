@@ -119,6 +119,7 @@ struct Config {
   int ndev = 0;
   bool verify = false, flag_kernel = false, ce_cycle_dst = false;
   bool parallel_host = true;
+  bool tma_xchunk = false;  // TMA: pipeline across ready groups
   bool panel_mode = false;
   std::string csv, dump;
 };
@@ -142,6 +143,9 @@ static void usage(const char* prog) {
       "                   workers; chunks >= --ce-ring-mib keep the ring)\n"
       "  --ce-ring-mib X  chunk size (MiB) at which per-peer streams fall\n"
       "                   back to the serial ring (default 8)\n"
+      "  --tma-xchunk     TMA: roll one pipeline across ready groups\n"
+      "                   instead of draining per ready group (lifts the\n"
+      "                   H <= n_comm delivery plateau)\n"
       "  --ce-reserve-sm N leave N compute blocks unused for iso-SM control\n"
       "  --intensity N    FMA ops per 16 B vector (default 1024)\n"
       "  --slices N       K-slices per row-block (default 16)\n"
@@ -188,6 +192,7 @@ static Config parse_args(int argc, char** argv) {
     else if (a == "--modes") { c.modes = split_csv(next()); mode_set = true; }
     else if (a == "--comm-streams") c.comm_streams = std::atoi(next().c_str());
     else if (a == "--ce-ring-mib") c.ce_ring_mib = std::atof(next().c_str());
+    else if (a == "--tma-xchunk") c.tma_xchunk = true;
     else if (a == "--ce-reserve-sm") c.ce_reserve_sm = std::atoi(next().c_str());
     else if (a == "--intensity") c.intensity = std::atoi(next().c_str());
     else if (a == "--slices") c.slices = std::atoi(next().c_str());
@@ -714,6 +719,7 @@ struct Bench {
     kc.local_mode = (var == V_TMA && mode == M_LOCAL) ? 1 : 0;
     kc.flag_scope_sys = var == V_CE ? 1 : 0;
     kc.chunk_major = chunk_major;
+    kc.xchunk = cfg.tma_xchunk ? 1 : 0;
     kc.log_slot = log_slot;
     kc.timing_slot = timing_slot;
     kc.timing_stride = n_sm;
@@ -1261,6 +1267,10 @@ int main(int argc, char** argv) {
                 "controls panels per ready flag\n");
   std::printf("tma pipeline: %d stages x 16 KiB = %.0f KiB smem/block\n",
               e4::kStages, e4::smem_bytes() / 1024.0);
+  if (cfg.panel_mode)
+    std::printf("tma ready-group scheduling: %s\n",
+                cfg.tma_xchunk ? "cross-group pipeline"
+                               : "drain per group");
   std::printf("host rank submission: %s\n",
               cfg.parallel_host ? "parallel workers" : "serial diagnostic");
   std::printf("timing: cooperative persistent grid, 1 block/SM; t_us_* = "
@@ -1290,7 +1300,7 @@ int main(int argc, char** argv) {
                    "drift_pct,slowdown,interference_sd,stall_sd,comm_gbps,"
                    "wait_p50_us,wait_p95_us,wait_max_us,bitsum_hex,err_count,"
                    "verify,axis,panel_h,e2e_us_mean,host_enqueue_ms,"
-                   "ce_reserve_sm,tma_stages\n");
+                   "ce_reserve_sm,tma_stages,tma_xchunk\n");
   }
   std::vector<FILE*> dt(b.world, nullptr), da(b.world, nullptr);
   if (!cfg.dump.empty()) {
@@ -1576,7 +1586,7 @@ int main(int argc, char** argv) {
                   "%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%d,%d,%d,%d,%d,"
                   "%d,%d,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,"
                   "%.4f,%.2f,%.2f,%.2f,%.2f,%016llx,%u,%s,%s,%d,%.2f,%.4f,%d,"
-                  "%d\n",
+                  "%d,%d\n",
                   b.var_name(), mode, b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", r, b.world, b.M,
                   cfg.n, b.K, b.G, b.n_chunks, chunk_bytes, b.n_comm,
@@ -1585,7 +1595,8 @@ int main(int argc, char** argv) {
                   st.mn, st.mx, bus, drift, slowdown, interf, stall, gbps,
                   w ? w->p50 : 0, w ? w->p95 : 0, w ? w->mx : 0, bsum, errs,
                   ver, cfg.panel_mode ? "panel" : "row", b.H, e2e_mean,
-                  host_ms, v == V_CE ? b.ce_reserve_eff : 0, e4::kStages);
+                  host_ms, v == V_CE ? b.ce_reserve_eff : 0, e4::kStages,
+                  cfg.tma_xchunk ? 1 : 0);
             };
             row("compute-only", base.st[r], it_b, 0, 0, 0, 0, nullptr,
                 base.err_count, base.e2e[r].mean, base.host_ms_per_iter);
@@ -1626,7 +1637,7 @@ int main(int argc, char** argv) {
                   csv,
                   "%s,comm-only,%s,%s,-1,%d,%d,%d,%d,%d,%d,%zu,0,0,%d,%d,%d,"
                   "%d,%d,%d,%u,%.2f,%.2f,%.2f,%.2f,%.2f,0,0,0,0,0,%.2f,0,0,0,"
-                  "%016llx,0,%s,%s,%d,%.2f,%.4f,%d,%d\n",
+                  "%016llx,0,%s,%s,%d,%.2f,%.4f,%d,%d,%d\n",
                   b.var_name(), b.use_memop ? "memop" : "kernel",
                   cfg.ce_cycle_dst ? "cycle" : "fixed", b.world, b.M, cfg.n,
                   b.K, b.G, b.n_chunks, chunk_bytes, b.streams_eff,
@@ -1634,7 +1645,8 @@ int main(int argc, char** argv) {
                   b.epoch,
                   ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us, ce_comm_us,
                   gbps_ce, 0ull, ver, cfg.panel_mode ? "panel" : "row", b.H,
-                  ce_comm_us, 0.0, b.ce_reserve_eff, e4::kStages);
+                  ce_comm_us, 0.0, b.ce_reserve_eff, e4::kStages,
+                  cfg.tma_xchunk ? 1 : 0);
           }
           if (w_comm && v == V_TMA) {
             double m = 0;

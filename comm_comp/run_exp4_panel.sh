@@ -154,7 +154,7 @@ nvidia-smi -i "$EXP4_GPU_IDS" \
   --format=csv > "$OUT/clocks_before.csv" 2>&1
 
 echo "=== build ==="
-make exp4_ag_tile_transport exp4_ag_tile_transport_deep -j4 2>&1 \
+make exp4_ag_tile_transport -j4 2>&1 \
   | tee "$OUT/build.log"
 BUILD_RC=${PIPESTATUS[0]}
 echo "$BUILD_RC" > "$OUT/build.exitcode"
@@ -246,40 +246,57 @@ else
 
       # TMA delivery-rate probe across the FULL H sweep.
       #
-      # 20260825_062853 showed TMA's implied delivery rate flat at ~66 GB/s for
-      # H <= 16 and ~145 GB/s from H >= 256 -- with the panel count constant at
-      # 49152, so it is a per-panel efficiency effect, not a work-volume one.
-      # That rate was reverse-solved from `fused - tail`, which conflates slow
-      # delivery with compute stalling for some other reason.  comm-only runs
-      # the same kernel with n_compute=0, so it reads the delivery rate
-      # directly; at coarse H it already agrees with the reverse-solved value
-      # to within 2%.  CE is excluded: its comm-only path is the host
-      # wall-clock loop, which disagrees with fused by 20-60% (unresolved) and
-      # would submit 49152 copies per pass at H=1.
+      # comm-only runs the same kernel with n_compute=0, so it reads the
+      # 16 comm SMs' delivery rate directly instead of reverse-solving it from
+      # `fused - tail`; at coarse H the two already agree to within 2%.
+      # 20260825_105601 measured the flat ~66 GB/s for H <= 16 and pinned the
+      # cause: process_job() pipelines only `items` panels and then drains,
+      # and items = ceil((H - panel_lane)/n_comm) is 1 for every H <= n_comm,
+      # so each panel pays an unoverlapped load + store + drain.  That run
+      # also falsified the depth hypothesis -- kStages 8 -> 13 moved nothing,
+      # exactly as one item per call predicts -- so the deep binary stays in
+      # the Makefile but is no longer part of the routine run.
       #
-      # The _deep binary is the same source at E4_TMA_STAGES=13 (vs 8).  The
-      # prologue issues min(H, kStages-2) loads, so if pipeline depth is what
-      # binds, the plateau moves; if it does not move, the limiter is the
-      # per-panel store handshake (tma_store_commit + tma_store_wait_read<1>)
-      # and that is what would have to change.
-      for SPEC in "stages8:exp4_ag_tile_transport" \
-                  "stages13:exp4_ag_tile_transport_deep"; do
+      # --tma-xchunk rolls one pipeline across ready groups and publishes each
+      # group kStages-2 panels behind the store stream.  Same panels, same
+      # order, same load balance: only the drain placement differs, so this is
+      # a clean A/B on that one decision.
+      for SPEC in "drain:" "xchunk:--tma-xchunk"; do
         TAG=${SPEC%%:*}
-        BIN=${SPEC#*:}
+        XFLAG=${SPEC#*:}
         run_case "exp4_tma_delivery_${TAG}" 1800 \
-          "./$BIN" \
+          ./exp4_ag_tile_transport \
           --ndev 4 \
           --m 65536 \
           --k 8192 \
           --panel-h 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384 \
           --n-comm 16 \
           --variants tma \
+          $XFLAG \
           --verify \
           --modes comm-only,compute-only \
           --warmup-ms 200 \
           --window-ms 2000 \
           --csv "$OUT/exp4_tma_delivery_${TAG}.csv"
       done
+
+      # End-to-end effect of the same switch over the fine-H half, where the
+      # plateau lives.  The default-mode counterpart for these H values is
+      # already in exp4_fig2_left.csv, so this is the paired arm.
+      run_case exp4_tma_fused_xchunk 1800 \
+        ./exp4_ag_tile_transport \
+        --ndev 4 \
+        --m 65536 \
+        --k 8192 \
+        --panel-h 1,2,4,8,16,32,64,128,256 \
+        --n-comm 16 \
+        --variants tma \
+        --tma-xchunk \
+        --verify \
+        --modes fused,compute-only \
+        --warmup-ms 500 \
+        --window-ms 5000 \
+        --csv "$OUT/exp4_tma_fused_xchunk.csv"
 
       validate_active_clocks
     fi
@@ -306,11 +323,9 @@ cp \
   run_exp4_panel.sh \
   "$OUT/" 2>> "$OUT/package.log" || FAILED=1
 
-for BIN in exp4_ag_tile_transport exp4_ag_tile_transport_deep; do
-  if [ -f "$BIN" ]; then
-    cp "$BIN" "$OUT/" 2>> "$OUT/package.log" || FAILED=1
-  fi
-done
+if [ -f exp4_ag_tile_transport ]; then
+  cp exp4_ag_tile_transport "$OUT/" 2>> "$OUT/package.log" || FAILED=1
+fi
 
 git diff --binary > "$OUT/source.diff"
 git log -1 --oneline > "$OUT/commit.txt"
