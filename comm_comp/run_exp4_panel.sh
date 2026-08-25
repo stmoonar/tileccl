@@ -187,6 +187,7 @@ else
       --k 1024 \
       --panel-h 1,16,64,256 \
       --n-comm 4 \
+      --variants ce-aggregate,tma \
       --iters 5 \
       --warmup-ms 10 \
       --verify \
@@ -203,6 +204,7 @@ else
         --k 8192 \
         --panel-h 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192 \
         --n-comm 8 \
+        --variants ce-aggregate,tma \
         --verify \
         --modes fused,compute-only \
         --warmup-ms 500 \

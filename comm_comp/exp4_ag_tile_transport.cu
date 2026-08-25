@@ -125,10 +125,10 @@ static void usage(const char* prog) {
       "  --k LIST         K sweep (default 1024,2048,4096,8192; K %% 64 == 0)\n"
       "  --g LIST         row-blocks per copy+flag (default 1,2,4,8,16)\n"
       "  --panel-h LIST   supplement: 128x64 panels per flag; enables\n"
-      "                   ce-aggregate,ce-panelized,tma variants\n"
+      "                   ce-aggregate,tma variants\n"
       "  --n-comm LIST    TMA comm blocks sweep (default 8)\n"
       "  --variants LIST  ce,tma; panel mode also accepts ce-aggregate,\n"
-      "                   ce-panelized (default all three)\n"
+      "                   ce-panelized (diagnostic opt-in; not default)\n"
       "  --modes LIST     fused,compute-only,comm-only,bystander,local,\n"
       "                   memop-cost,arrival (default all)\n"
       "  --comm-streams N CE streams: 1 = serial ring (flux), 3 = per peer\n"
@@ -215,8 +215,7 @@ static Config parse_args(int argc, char** argv) {
       std::fprintf(stderr, "--panel-h and --g are separate axes; omit --g in panel mode\n");
       std::exit(1);
     }
-    if (!var_set)
-      c.variants = {"ce-aggregate", "ce-panelized", "tma"};
+    if (!var_set) c.variants = {"ce-aggregate", "tma"};
     if (c.comm_streams != 1) {
       std::fprintf(stderr, "panel mode currently requires --comm-streams 1\n");
       std::exit(1);
@@ -1048,10 +1047,12 @@ struct Bench {
   }
 
   // (b) TMA transport: scrub the remote panels of A_staged, rebuild them with
-  // one fused-TMA iteration over NVLink, compare bitwise against the shadow.
-  // Two independent paths produce the same bytes: transform kernel vs
-  // tensor-map load + bulk store.
-  bool verify_tma_staged() {
+  // one fused-TMA iteration over NVLink, compare bitwise against the shadow,
+  // and retain the checksum consumed by the dependent compute blocks.  The
+  // caller compares that checksum with the compute-only reference, proving
+  // not merely that HBM is correct after kernel exit, but that the release
+  // flag did not become visible before the TMA data did.
+  bool verify_tma_staged(unsigned long long* fused_bitsum) {
     for (int r = 0; r < world; ++r) {
       CUDA_CHECK(cudaSetDevice(r));
       __half* s = R[r].A_staged;
@@ -1060,12 +1061,17 @@ struct Bench {
       if (lo) CUDA_CHECK(cudaMemset(s, 0x55, lo * 2));
       if (full_elems() - hi)
         CUDA_CHECK(cudaMemset(s + hi, 0x55, (full_elems() - hi) * 2));
+      CUDA_CHECK(cudaMemset(R[r].bitsum, 0, sizeof(unsigned long long)));
       // the memsets run on the legacy default stream, which does NOT order
       // against the non-blocking pipeline streams (exp2's documented footgun)
       CUDA_CHECK(cudaDeviceSynchronize());
     }
     one_fused_iter();
     for (int r = 0; r < world; ++r) {
+      CUDA_CHECK(cudaSetDevice(r));
+      CUDA_CHECK(cudaMemcpy(&fused_bitsum[r], R[r].bitsum,
+                            sizeof(unsigned long long),
+                            cudaMemcpyDeviceToHost));
       const size_t lo = e4::blocked_off(r * rps, 0, P);
       const size_t hi = e4::blocked_off((r + 1) * rps, 0, P);
       if (lo && !device_equal(r, R[r].A_staged, R[r].A_shadow, lo * 2))
@@ -1361,11 +1367,16 @@ int main(int argc, char** argv) {
           // verify
           bool ver_ok = a_ok;
           unsigned long long bs_ce[e4::kMaxWorld] = {0},
-                             bs_tma[e4::kMaxWorld] = {0};
+                             bs_tma[e4::kMaxWorld] = {0},
+                             bs_tma_fused[e4::kMaxWorld] = {0};
           if (cfg.verify) {
-            if (v == V_TMA && !b.verify_tma_staged()) ver_ok = false;
+            if (v == V_TMA && !b.verify_tma_staged(bs_tma_fused))
+              ver_ok = false;
             if (v == V_CE && !b.verify_ce_blob()) ver_ok = false;
             if (!b.verify_bitsum(bs_ce, bs_tma)) ver_ok = false;
+            if (v == V_TMA)
+              for (int r = 0; r < b.world; ++r)
+                if (bs_tma_fused[r] != bs_tma[r]) ver_ok = false;
             if (!ver_ok) std::printf("  !! verify FAIL\n");
           }
           const char* ver = !cfg.verify ? "-" : (ver_ok ? "ok" : "FAIL");

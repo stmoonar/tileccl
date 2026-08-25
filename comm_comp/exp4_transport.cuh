@@ -394,8 +394,7 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
     uint64_t slot_base = 0;   // monotonic stage counter across chunks
     uint32_t phase_bits = 0;  // bit s = expected parity of bar[s]
 
-    auto process_job = [&](int j, int panel_lane, int panel_stride,
-                           int workers_for_job) {
+    auto process_job = [&](int j, int panel_lane, int panel_stride) {
       const int peer_i = j / cfg.cps;
       const int c_in = j % cfg.cps;
       const int owner = (cfg.rank + 1 + peer_i) % cfg.world;
@@ -446,31 +445,40 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
       // the flag says "data is IN HBM", so wait end-to-end, not just .read
       tma_store_wait_all<0>();
       const int chunk = owner * cfg.cps + c_in;
-      if (workers_for_job == 1) {
+      if (!cfg.panel_mode) {
         st_release_gpu(&flags[flag_idx(chunk)], cfg.epoch);
       } else {
-        // acq_rel RMWs form a release sequence across the workers.  The last
-        // worker has therefore observed every peer-panel store completion
-        // before it publishes the single chunk-ready flag.
-        const uint32_t old = atomic_add_acq_rel_gpu(&chunk_done[chunk], 1u);
-        if (old + 1u == (uint32_t)workers_for_job)
+        // Every communication block contributes `items` completed panels to
+        // this ready group.  acq_rel RMWs form a release sequence across the
+        // contributors, so the block that observes all H panels also observes
+        // every preceding TMA-store completion before publishing the flag.
+        const uint32_t old =
+            atomic_add_acq_rel_gpu(&chunk_done[chunk], (uint32_t)items);
+        if (old + (uint32_t)items == (uint32_t)cfg.H)
           st_release_gpu(&flags[flag_idx(chunk)], cfg.epoch);
       }
     };
 
-    if (cfg.panel_mode && cfg.H >= cfg.n_comm &&
-        n_jobs % cfg.n_comm != 0) {
-      // Coarse ready groups may not divide evenly across communication SMs.
-      // Every communication block takes a strided slice of every job.  This
-      // avoids both a 2-vs-1 job imbalance at 32 MiB and an 8-block / 3-peer
-      // imbalance at 128 MiB.
-      const int active_workers = cfg.n_comm < cfg.H ? cfg.n_comm : cfg.H;
-      if ((int)blockIdx.x < active_workers)
-        for (int j = 0; j < n_jobs; ++j)
-          process_job(j, blockIdx.x, cfg.n_comm, active_workers);
+    if (cfg.panel_mode) {
+      // One scheduling rule for the entire H sweep: globally number all remote
+      // panels in rank-major ready-group order and statically stripe them over
+      // the communication blocks.  This gives every block the same total
+      // panel count without switching algorithms when n_jobs stops dividing
+      // n_comm.  Adjacent striped panels belonging to the same ready group are
+      // kept in one process_job call so its TMA loads/stores remain pipelined.
+      const int total_panels = n_jobs * cfg.H;
+      int panel_linear = (int)blockIdx.x;
+      while (panel_linear < total_panels) {
+        const int j = panel_linear / cfg.H;
+        const int panel_lane = panel_linear % cfg.H;
+        process_job(j, panel_lane, cfg.n_comm);
+        const int panels_from_this_block =
+            (cfg.H - panel_lane + cfg.n_comm - 1) / cfg.n_comm;
+        panel_linear += panels_from_this_block * cfg.n_comm;
+      }
     } else {
       for (int j = blockIdx.x; j < n_jobs; j += cfg.n_comm)
-        process_job(j, 0, 1, 1);
+        process_job(j, 0, 1);
     }
     if (my_timing) my_timing->done_ns = globaltimer();
     return;  // exit when the job list is exhausted (no block migrates onto

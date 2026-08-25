@@ -237,7 +237,7 @@ tests/pipeline_e2e.cu 的原则），只有旗标生产者和 A 源指针不同�
   搬的字节是真实行数据，但消费者从预先变换好的本地 shadow 缓冲加载。
 - `tma`：同一 kernel 里 blockIdx < n_comm 的 block 专职通信——对 peer 分片
   的 2D tensor-map TMA load（描述符建在 peer 指针上）→ smem → 1D bulk
-  store 成本地 tile-blocked panel → `st.release.sys` 发旗标。消费者读的就
+  store 成本地 tile-blocked panel → `st.release.gpu` 发旗标。消费者读的就
   是真搬来的数据。grid ≤ SM 数保证全部 block 常驻，构造性避免 flux SM-AG
   需要的"producer 已驻留"信号。
 
@@ -275,10 +275,11 @@ make exp4_ag_tile_transport
 ./exp4_ag_tile_transport --k 8192 --g 4 --n-comm 1,2,4,8,16 --variants tma
 ```
 
-`--verify` 五件套：(a) 布局变换 vs host 独立参照；(b) TMA staging 与
-shadow 逐位一致（transform kernel 与 tensor-map 两条独立路径）；(c) CE
-blob 与 peer 分片逐位一致；(d) CE/TMA 两变体计算校验和逐位相等（可交换
-整数 wrapping add，网格划分无关）；(e) 消费者读到的 epoch 断言
+`--verify` 六件套：(a) 布局变换 vs host 独立参照；(b) TMA staging 与
+shadow 逐位一致（transform kernel 与 tensor-map 两条独立路径）；(c) fused-TMA
+当次计算校验和与 compute-only 参照相等，验证 flag 发布时数据已对 consumer
+可见；(d) CE blob 与 peer 分片逐位一致；(e) CE/TMA 两变体 compute-only
+校验和逐位相等（可交换整数 wrapping add，网格划分无关）；(f) 消费者读到的 epoch 断言
 （`err_count` 列）。CSV 每行带 `flag_mech`（memop/kernel fallback，绝不
 静默混行）与 `ce_dst`（fixed/`--ce-cycle-dst`）。
 
@@ -291,11 +292,10 @@ peer shard 边界。
 固定 K 时，总 AG 字节数与总合成计算量不随 H 改变：
 
 - `ce-aggregate`：每个 chunk 发一次 `H×16 KiB` 连续 dummy copy，再发 flag；
-- `ce-panelized`：每个 chunk 连续发 H 次 16 KiB dummy copy，再发 flag；
 - `tma`：H 次真实 `128×64` peer TMA load → local HBM store，再发 flag，
   consumer 读取真正搬到的 panel。
 
-三者的字节数、flag 粒度和 consumer 工作完全相同。CE consumer 按实验定义
+两者的字节数、flag 粒度和 consumer 工作完全相同。CE consumer 按实验定义
 读取预变换 shadow。宿主默认使用每 GPU 一个持久 worker 并行提交，模拟 Flux
 一进程一卡；每轮先在所有 rank 提交自旋等待 flag 的 consumer，再并行提交 CE
 copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前提前到达。
@@ -319,9 +319,12 @@ copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前�
 # （脚本含 1300 MHz 锁频、负载持频检查、verify 和结果打包）
 ./run_exp4_panel.sh
 
+# 本地绘图：只画 CE aggregate/TMA，分别输出 mean、p50、p95 三张 PNG/PDF
+python plot_exp4_fig2_left.py /path/to/extracted_result
+
 # 等 SM 对照：CE 也空出与 n_comm=8 相同的 8 个 compute block
 ./exp4_ag_tile_transport --k 8192 --panel-h 1,8,128 \
-    --variants ce-aggregate,ce-panelized --ce-reserve-sm 8 --verify \
+    --variants ce-aggregate --ce-reserve-sm 8 --verify \
     --modes fused,compute-only,bystander,memop-cost \
     --warmup-ms 500 --window-ms 200 --csv exp4_panel_ce_isosm.csv
 
@@ -334,10 +337,11 @@ copy/flag，避免小 copy 的宿主提交时间让数据在 consumer 启动前�
 
 panel 模式下 CSV 仍令 `g_rb=1`，并新增末尾列 `axis=panel` 与 `panel_h=H`；
 `chunk_bytes=H×16384` 是实际每 flag 字节数；H 必须整除每 shard 的 panel 总数。
-粗粒度 panel job 不能被 `n_comm` 整除时，全部通信 block 会按 stride 共同搬运
-每个大 chunk，最后一个完成者才发布唯一 flag；因此 32--128 MiB 点不会出现
-job 数不均衡，也不会把 128 MiB 的 TMA 静默降成 3 个 SM。row 模式仍把通信
-block 截断到实际 job 数。
+TMA 在整个 H sweep 中只使用一种静态调度：把全部 remote panel 按 rank-major
+ready-group 顺序线性编号，通信 block `b` 始终处理 `b, b+n_comm, ...`。每个
+ready group 的完成 panel 数由 device counter 汇合，最后一个贡献者发布唯一
+flag。这样所有 H 下每个通信 block 搬运相同数量的 panel，不再在 32 MiB 处
+切换算法，也不会把 128 MiB 的 TMA 静默降成 3 个 SM。row 模式仍按 job 分配。
 128 MiB 点需要 `M=32768,K=8192`，主要 device buffer 合计约 1.5 GiB/GPU；
 实验只检验 CE/TMA 是否出现 crossover，不预设 CE 必然超过。
 
