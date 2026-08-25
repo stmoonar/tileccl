@@ -6,8 +6,8 @@ import argparse
 from pathlib import Path
 
 import matplotlib as mpl
-mpl.use("Agg")
-import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 import pandas as pd
 
 
@@ -38,7 +38,9 @@ def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path) -> None:
         .sort_values(["variant", "panel_h"])
     )
 
-    fig, ax = plt.subplots(figsize=(8.2, 4.2))
+    fig = Figure(figsize=(8.2, 4.2))
+    FigureCanvasAgg(fig)
+    ax = fig.subplots()
     for variant in LABELS:
         rows = curves[curves["variant"] == variant]
         ax.plot(
@@ -67,7 +69,7 @@ def plot_one(paired: pd.DataFrame, stat: str, out_dir: Path) -> None:
     stem = out_dir / f"fig2_left_compute_slowdown_{stat}"
     fig.savefig(stem.with_suffix(".png"), bbox_inches="tight")
     fig.savefig(stem.with_suffix(".pdf"), bbox_inches="tight")
-    plt.close(fig)
+    fig.clear()
 
 
 def main() -> None:
