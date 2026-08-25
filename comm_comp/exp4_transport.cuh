@@ -493,7 +493,8 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
       // list is exactly the one the default path walks -- global panel index
       // blockIdx.x + k*n_comm -- so the source access pattern and the load
       // balance are unchanged; only the drain moves.
-      constexpr int kDepth = kStages - 2;
+      constexpr int kDepth = kStages - 2;  // loads in flight
+      constexpr int kLag = 32;             // stores allowed in flight
       const int total_panels = n_jobs * cfg.H;
       const int first = (int)blockIdx.x;
       const int my_count =
@@ -535,19 +536,40 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
         tma_store_commit();
       };
 
-      // Called only once panel k's store is known to be in HBM, so the
-      // release below still means "data has landed", exactly as in the
-      // default path.  One contribution per panel; the group's H-th
-      // contributor publishes.
-      auto publish_k = [&](int k) {
-        int chunk, rb_c, p, peer_i;
-        locate(k, chunk, rb_c, p, peer_i);
-        const uint32_t old = atomic_add_acq_rel_gpu(&chunk_done[chunk], 1u);
-        if (old + 1u == (uint32_t)cfg.H)
-          st_release_gpu(&flags[flag_idx(chunk)], cfg.epoch);
+      // Last index in this block's list that still belongs to group g.
+      // The block's panels for one group are consecutive in k because k
+      // advances the global panel index by n_comm.
+      auto group_of = [&](int k) { return (first + k * cfg.n_comm) / cfg.H; };
+      auto last_k_of = [&](int g) {
+        const int hi = (g + 1) * cfg.H - first;   // exclusive bound on k*n_comm
+        const int e = (hi + cfg.n_comm - 1) / cfg.n_comm - 1;
+        return e < my_count - 1 ? e : my_count - 1;
       };
 
-      int issued = 0, stored = 0, published = 0;
+      int issued = 0, stored = 0, acct = 0;
+      int cur_g = my_count ? group_of(0) : 0;
+      int cur_end = my_count ? last_k_of(cur_g) : -1;
+
+      // Account for every panel of one ready group at once, exactly as the
+      // default path does.  The caller guarantees those stores have retired,
+      // so the release below still means "data is in HBM".
+      auto flush_group = [&]() {
+        const uint32_t n = (uint32_t)(cur_end - acct + 1);
+        const int peer_i = cur_g / cfg.cps, c_in = cur_g % cfg.cps;
+        const int chunk =
+            ((cfg.rank + 1 + peer_i) % cfg.world) * cfg.cps + c_in;
+        const uint32_t old = atomic_add_acq_rel_gpu(&chunk_done[chunk], n);
+        if (old + n == (uint32_t)cfg.H)
+          st_release_gpu(&flags[flag_idx(chunk)], cfg.epoch);
+        acct = cur_end + 1;
+        if (acct < my_count) {
+          cur_g = group_of(acct);
+          cur_end = last_k_of(cur_g);
+        } else {
+          cur_end = -1;
+        }
+      };
+
       for (; issued < my_count && issued < kDepth; ++issued) issue_k(issued);
       while (stored < my_count) {
         const uint32_t s = (uint32_t)(stored % kStages);
@@ -559,13 +581,20 @@ __global__ __launch_bounds__(kThreads, 1) void ag_consume_kernel(
           tma_store_wait_read<1>();
           issue_k(issued++);
         }
-        // <= kDepth store groups may still be pending, so groups
-        // 0 .. stored-kDepth-1 have completed end-to-end.
-        tma_store_wait_all<kDepth>();
-        for (; published + kDepth < stored; ++published) publish_k(published);
+        // Only synchronise when a whole ready group has been stored AND is
+        // kLag behind the stream.  Gating on the group boundary rather than
+        // on every panel is what keeps this from throttling: at H > n_comm a
+        // group is `items` panels wide, so the wait happens once per items
+        // panels and stores accumulate freely in between -- 20260825_115231
+        // measured a per-panel wait_all<6> pinning every H at 88 GB/s, 39%
+        // below the drain path's 145 GB/s at coarse H.
+        while (cur_end >= 0 && stored > cur_end + kLag) {
+          tma_store_wait_all<kLag>();
+          flush_group();
+        }
       }
       tma_store_wait_all<0>();
-      for (; published < my_count; ++published) publish_k(published);
+      while (cur_end >= 0) flush_group();
     } else if (cfg.panel_mode) {
       // One scheduling rule for the entire H sweep: globally number all remote
       // panels in rank-major ready-group order and statically stripe them over
